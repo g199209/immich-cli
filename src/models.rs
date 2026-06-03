@@ -42,6 +42,7 @@ pub struct SearchResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AssetsBucket {
     #[allow(dead_code)]
     pub total: u32,
