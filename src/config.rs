@@ -74,3 +74,116 @@ fn expand_tilde(input: &str) -> String {
     }
     input.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_config(text: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn parses_minimum_config() {
+        let f = write_config(
+            r#"
+server_url = "http://example.com:2283/"
+api_key = "abc"
+"#,
+        );
+        let cfg = Config::load(Some(f.path())).unwrap();
+        // Trailing slash is stripped so URL joins are predictable.
+        assert_eq!(cfg.server_url, "http://example.com:2283");
+        assert_eq!(cfg.api_key, "abc");
+        assert!(cfg.path_map.is_empty());
+        assert_eq!(cfg.timeout_secs, 60);
+    }
+
+    #[test]
+    fn parses_path_map_and_strips_trailing_slashes() {
+        let f = write_config(
+            r#"
+server_url = "http://x"
+api_key = "k"
+timeout_secs = 5
+
+[[path_map]]
+server = "/mnt/a/"
+local  = "/home/u/A/"
+
+[[path_map]]
+server = "/mnt/b"
+local  = "/home/u/B"
+"#,
+        );
+        let cfg = Config::load(Some(f.path())).unwrap();
+        assert_eq!(cfg.timeout_secs, 5);
+        assert_eq!(cfg.path_map.len(), 2);
+        assert_eq!(cfg.path_map[0].server, "/mnt/a");
+        assert_eq!(cfg.path_map[0].local, "/home/u/A");
+        assert_eq!(cfg.path_map[1].server, "/mnt/b");
+        assert_eq!(cfg.path_map[1].local, "/home/u/B");
+    }
+
+    #[test]
+    fn tilde_in_local_path_is_expanded() {
+        let f = write_config(
+            r#"
+server_url = "http://x"
+api_key = "k"
+[[path_map]]
+server = "/mnt/a"
+local  = "~/Pictures"
+"#,
+        );
+        let cfg = Config::load(Some(f.path())).unwrap();
+        let home = directories::UserDirs::new()
+            .unwrap()
+            .home_dir()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(cfg.path_map[0].local, format!("{home}/Pictures"));
+    }
+
+    #[test]
+    fn rejects_empty_server_url() {
+        let f = write_config(
+            r#"
+server_url = ""
+api_key = "k"
+"#,
+        );
+        let err = Config::load(Some(f.path())).unwrap_err().to_string();
+        assert!(err.contains("server_url"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_api_key() {
+        let f = write_config(
+            r#"
+server_url = "http://x"
+api_key = ""
+"#,
+        );
+        let err = Config::load(Some(f.path())).unwrap_err().to_string();
+        assert!(err.contains("api_key"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_file_reports_path() {
+        let err = Config::load(Some(std::path::Path::new("/no/such/cfg.toml")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/no/such/cfg.toml"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unparseable_toml() {
+        let f = write_config("server_url = 'http://x'\napi_key = 'k\n");
+        assert!(Config::load(Some(f.path())).is_err());
+    }
+}

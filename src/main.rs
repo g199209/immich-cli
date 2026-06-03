@@ -1,12 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use immich_cli::{commands, config};
 use std::path::PathBuf;
-
-mod client;
-mod commands;
-mod config;
-mod models;
-mod path_map;
 
 #[derive(Parser, Debug)]
 #[command(

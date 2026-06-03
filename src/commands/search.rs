@@ -1,5 +1,5 @@
-use crate::client::ImmichClient;
-use crate::config::Config;
+use crate::client::{ImmichClient, SearchBackend};
+use crate::config::{Config, PathMapEntry};
 use crate::models::{Asset, SearchRequest};
 use crate::path_map;
 use anyhow::{bail, Context, Result};
@@ -92,21 +92,49 @@ pub enum OutputFormat {
     Table,
 }
 
+impl SearchArgs {
+    /// Returns true if at least one user-facing filter is set. We reject
+    /// "empty" searches because dumping the entire library at random is
+    /// almost certainly not what the caller intended.
+    pub fn has_filter(&self) -> bool {
+        self.query.is_some()
+            || self.taken_after.is_some()
+            || self.taken_before.is_some()
+            || self.city.is_some()
+            || self.state.is_some()
+            || self.country.is_some()
+            || self.r#type.is_some()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.limit == 0 {
+            bail!("--limit must be > 0");
+        }
+        if self.page_size == 0 {
+            bail!("--page-size must be > 0");
+        }
+        if !self.has_filter() {
+            bail!(
+                "search requires at least one filter: --query, --taken-after, \
+                 --taken-before, --city, --state, --country, or --type"
+            );
+        }
+        Ok(())
+    }
+}
+
 pub fn run(cfg: &Config, args: SearchArgs) -> Result<()> {
-    if args.limit == 0 {
-        bail!("--limit must be > 0");
-    }
-    if args.page_size == 0 {
-        bail!("--page-size must be > 0");
-    }
+    args.validate()?;
 
     let client = ImmichClient::new(cfg)?;
     let assets = fetch_assets(&client, &args)?;
 
-    emit(cfg, &args, &assets)
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    emit_to_writer(&cfg.path_map, &args, &assets, &mut out)
 }
 
-fn fetch_assets(client: &ImmichClient, args: &SearchArgs) -> Result<Vec<Asset>> {
+pub fn fetch_assets<B: SearchBackend>(backend: &B, args: &SearchArgs) -> Result<Vec<Asset>> {
     let taken_after = args
         .taken_after
         .as_deref()
@@ -136,7 +164,7 @@ fn fetch_assets(client: &ImmichClient, args: &SearchArgs) -> Result<Vec<Asset>> 
             with_exif: Some(true),
         };
 
-        let resp = client.search(&req)?;
+        let resp = backend.search(&req)?;
         let count = resp.assets.items.len();
         let has_more = resp.assets.next_page.as_ref().is_some_and(|v| !v.is_null());
 
@@ -157,12 +185,12 @@ fn fetch_assets(client: &ImmichClient, args: &SearchArgs) -> Result<Vec<Asset>> 
 
 /// Accept either a full ISO 8601 timestamp or a bare `YYYY-MM-DD`. For the
 /// bare form, expand to UTC 00:00:00 (start of that day).
-fn normalize_date_start(input: &str) -> Result<String> {
+pub fn normalize_date_start(input: &str) -> Result<String> {
     normalize_date(input, false)
 }
 
 /// Bare `YYYY-MM-DD` becomes UTC 23:59:59.999 of that day (end of day).
-fn normalize_date_end(input: &str) -> Result<String> {
+pub fn normalize_date_end(input: &str) -> Result<String> {
     normalize_date(input, true)
 }
 
@@ -187,14 +215,15 @@ fn normalize_date(input: &str, end_of_day: bool) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn emit(cfg: &Config, args: &SearchArgs, assets: &[Asset]) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    use std::io::Write;
-
+pub fn emit_to_writer<W: std::io::Write>(
+    path_map: &[PathMapEntry],
+    args: &SearchArgs,
+    assets: &[Asset],
+    out: &mut W,
+) -> Result<()> {
     let mut rows: Vec<Row> = Vec::with_capacity(assets.len());
     for asset in assets {
-        let local = path_map::translate(&asset.original_path, &cfg.path_map);
+        let local = path_map::translate(&asset.original_path, path_map);
         let unmapped = local.is_none();
         if unmapped && !args.include_unmapped {
             eprintln!(
@@ -264,7 +293,7 @@ fn emit(cfg: &Config, args: &SearchArgs, assets: &[Asset]) -> Result<()> {
             }
         }
         OutputFormat::Table => {
-            write_table(&mut out, &rows)?;
+            write_table(out, &rows)?;
         }
     }
 
@@ -339,3 +368,393 @@ fn write_table(out: &mut impl std::io::Write, rows: &[Row<'_>]) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{AssetsBucket, ExifInfo, SearchResponse};
+    use std::cell::RefCell;
+
+    fn make_asset(id: &str, path: &str, asset_type: &str, taken: &str) -> Asset {
+        Asset {
+            id: id.into(),
+            original_path: path.into(),
+            original_file_name: path.rsplit('/').next().unwrap_or(path).into(),
+            asset_type: asset_type.into(),
+            file_created_at: Some(taken.into()),
+            local_date_time: Some(taken.into()),
+            exif_info: Some(ExifInfo {
+                city: Some("Shanghai".into()),
+                state: Some("Shanghai".into()),
+                country: Some("China".into()),
+                latitude: Some(31.0),
+                longitude: Some(121.0),
+            }),
+        }
+    }
+
+    fn default_args() -> SearchArgs {
+        SearchArgs {
+            query: None,
+            taken_after: None,
+            taken_before: None,
+            city: None,
+            state: None,
+            country: None,
+            r#type: None,
+            limit: 250,
+            page_size: 250,
+            format: OutputFormat::Paths,
+            verify: false,
+            include_missing: false,
+            include_unmapped: false,
+        }
+    }
+
+    /// Records each call and replays canned responses in order. Optional
+    /// `assert_fn` lets a test verify the request body the backend sees.
+    struct FakeBackend {
+        responses: RefCell<Vec<SearchResponse>>,
+        calls: RefCell<Vec<SearchRequest>>,
+    }
+
+    impl FakeBackend {
+        fn new(responses: Vec<SearchResponse>) -> Self {
+            Self {
+                responses: RefCell::new(responses),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<SearchRequest> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl SearchBackend for FakeBackend {
+        fn search(&self, req: &SearchRequest) -> Result<SearchResponse> {
+            self.calls.borrow_mut().push(SearchRequest {
+                query: req.query.clone(),
+                city: req.city.clone(),
+                state: req.state.clone(),
+                country: req.country.clone(),
+                taken_after: req.taken_after.clone(),
+                taken_before: req.taken_before.clone(),
+                asset_type: req.asset_type.clone(),
+                page: req.page,
+                size: req.size,
+                with_exif: req.with_exif,
+            });
+            let mut q = self.responses.borrow_mut();
+            if q.is_empty() {
+                anyhow::bail!("FakeBackend ran out of canned responses");
+            }
+            Ok(q.remove(0))
+        }
+    }
+
+    fn resp(items: Vec<Asset>, next: Option<&str>) -> SearchResponse {
+        let total = items.len() as u32;
+        SearchResponse {
+            assets: AssetsBucket {
+                total,
+                count: total,
+                items,
+                next_page: next.map(|s| serde_json::Value::String(s.into())),
+            },
+        }
+    }
+
+    // ---- Args validation -----------------------------------------------
+
+    #[test]
+    fn validate_rejects_empty_filter() {
+        let args = default_args();
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("at least one filter"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_query_only() {
+        let mut args = default_args();
+        args.query = Some("x".into());
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_time_only() {
+        let mut args = default_args();
+        args.taken_after = Some("2025-01-01".into());
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_type_only() {
+        let mut args = default_args();
+        args.r#type = Some(AssetTypeArg::Video);
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_limit() {
+        let mut args = default_args();
+        args.query = Some("x".into());
+        args.limit = 0;
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_page_size() {
+        let mut args = default_args();
+        args.query = Some("x".into());
+        args.page_size = 0;
+        assert!(args.validate().is_err());
+    }
+
+    // ---- Date normalization --------------------------------------------
+
+    #[test]
+    fn date_start_expands_to_utc_midnight() {
+        let got = normalize_date_start("2025-03-04").unwrap();
+        assert_eq!(got, "2025-03-04T00:00:00.000Z");
+    }
+
+    #[test]
+    fn date_end_expands_to_utc_eod() {
+        let got = normalize_date_end("2025-03-04").unwrap();
+        assert_eq!(got, "2025-03-04T23:59:59.999Z");
+    }
+
+    #[test]
+    fn date_iso_passthrough() {
+        let got = normalize_date_start("2025-03-04T12:34:56Z").unwrap();
+        assert_eq!(got, "2025-03-04T12:34:56Z");
+    }
+
+    #[test]
+    fn date_invalid_yyyymmdd_rejected() {
+        let err = normalize_date_start("2025-13-99").unwrap_err().to_string();
+        assert!(err.contains("invalid date"), "got: {err}");
+    }
+
+    // ---- fetch_assets --------------------------------------------------
+
+    #[test]
+    fn fetch_walks_pages_until_next_is_null() {
+        let backend = FakeBackend::new(vec![
+            resp(
+                vec![
+                    make_asset("a1", "/mnt/x/a.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
+                    make_asset("a2", "/mnt/x/b.jpg", "IMAGE", "2025-01-02T00:00:00Z"),
+                ],
+                Some("2"),
+            ),
+            resp(
+                vec![make_asset("a3", "/mnt/x/c.jpg", "IMAGE", "2025-01-03T00:00:00Z")],
+                None,
+            ),
+        ]);
+        let mut args = default_args();
+        args.query = Some("anything".into());
+        args.page_size = 2;
+        args.limit = 10;
+
+        let assets = fetch_assets(&backend, &args).unwrap();
+        assert_eq!(assets.len(), 3);
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].page, Some(1));
+        assert_eq!(calls[1].page, Some(2));
+        // The query is propagated as-is, and with_exif is forced on so the
+        // table/json output can show location.
+        assert_eq!(calls[0].query.as_deref(), Some("anything"));
+        assert_eq!(calls[0].with_exif, Some(true));
+    }
+
+    #[test]
+    fn fetch_stops_at_limit_even_if_more_available() {
+        let backend = FakeBackend::new(vec![resp(
+            vec![
+                make_asset("a1", "/mnt/x/a.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
+                make_asset("a2", "/mnt/x/b.jpg", "IMAGE", "2025-01-02T00:00:00Z"),
+                make_asset("a3", "/mnt/x/c.jpg", "IMAGE", "2025-01-03T00:00:00Z"),
+            ],
+            Some("2"),
+        )]);
+        let mut args = default_args();
+        args.country = Some("China".into());
+        args.page_size = 10;
+        args.limit = 2;
+
+        let assets = fetch_assets(&backend, &args).unwrap();
+        assert_eq!(assets.len(), 2);
+        // Only the first page should have been requested.
+        assert_eq!(backend.calls().len(), 1);
+    }
+
+    #[test]
+    fn fetch_sends_geo_and_type_filters_through() {
+        let backend = FakeBackend::new(vec![resp(vec![], None)]);
+        let mut args = default_args();
+        args.city = Some("Kangqiao".into());
+        args.state = Some("Shanghai".into());
+        args.country = Some("China".into());
+        args.r#type = Some(AssetTypeArg::Video);
+        args.taken_after = Some("2025-01-01".into());
+        args.taken_before = Some("2025-12-31".into());
+
+        fetch_assets(&backend, &args).unwrap();
+        let calls = backend.calls();
+        assert_eq!(calls[0].city.as_deref(), Some("Kangqiao"));
+        assert_eq!(calls[0].state.as_deref(), Some("Shanghai"));
+        assert_eq!(calls[0].country.as_deref(), Some("China"));
+        assert_eq!(calls[0].asset_type.as_deref(), Some("VIDEO"));
+        assert_eq!(
+            calls[0].taken_after.as_deref(),
+            Some("2025-01-01T00:00:00.000Z")
+        );
+        assert_eq!(
+            calls[0].taken_before.as_deref(),
+            Some("2025-12-31T23:59:59.999Z")
+        );
+    }
+
+    #[test]
+    fn fetch_propagates_backend_errors() {
+        struct ErrBackend;
+        impl SearchBackend for ErrBackend {
+            fn search(&self, _req: &SearchRequest) -> Result<SearchResponse> {
+                anyhow::bail!("immich exploded")
+            }
+        }
+        let mut args = default_args();
+        args.query = Some("x".into());
+        let err = fetch_assets(&ErrBackend, &args).unwrap_err().to_string();
+        assert!(err.contains("immich exploded"), "got: {err}");
+    }
+
+    // ---- emit_to_writer ------------------------------------------------
+
+    fn pmap() -> Vec<PathMapEntry> {
+        vec![PathMapEntry {
+            server: "/mnt/qnap".into(),
+            local: "/home/u/Photos".into(),
+        }]
+    }
+
+    #[test]
+    fn emit_paths_default_skips_unmapped_with_warning() {
+        let assets = vec![
+            make_asset("a1", "/mnt/qnap/a.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
+            make_asset("a2", "/other/b.jpg", "IMAGE", "2025-01-02T00:00:00Z"),
+        ];
+        let mut args = default_args();
+        args.query = Some("x".into());
+        let mut buf = Vec::new();
+        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.trim(), "/home/u/Photos/a.jpg");
+    }
+
+    #[test]
+    fn emit_paths_include_unmapped_marks_them() {
+        let assets = vec![make_asset(
+            "a2",
+            "/other/b.jpg",
+            "IMAGE",
+            "2025-01-02T00:00:00Z",
+        )];
+        let mut args = default_args();
+        args.query = Some("x".into());
+        args.include_unmapped = true;
+        let mut buf = Vec::new();
+        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.trim(), "UNMAPPED\t/other/b.jpg");
+    }
+
+    #[test]
+    fn emit_paths_verify_skips_missing_files() {
+        let assets = vec![make_asset(
+            "a1",
+            "/mnt/qnap/nope.jpg",
+            "IMAGE",
+            "2025-01-01T00:00:00Z",
+        )];
+        let mut args = default_args();
+        args.query = Some("x".into());
+        args.verify = true;
+        let mut buf = Vec::new();
+        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        assert!(String::from_utf8(buf).unwrap().is_empty());
+    }
+
+    #[test]
+    fn emit_paths_verify_with_include_missing_emits_marker() {
+        let assets = vec![make_asset(
+            "a1",
+            "/mnt/qnap/nope.jpg",
+            "IMAGE",
+            "2025-01-01T00:00:00Z",
+        )];
+        let mut args = default_args();
+        args.query = Some("x".into());
+        args.verify = true;
+        args.include_missing = true;
+        let mut buf = Vec::new();
+        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.trim(), "MISSING\t/home/u/Photos/nope.jpg");
+    }
+
+    #[test]
+    fn emit_json_is_ndjson() {
+        let assets = vec![
+            make_asset("a1", "/mnt/qnap/a.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
+            make_asset("a2", "/mnt/qnap/b.jpg", "VIDEO", "2025-01-02T00:00:00Z"),
+        ];
+        let mut args = default_args();
+        args.query = Some("x".into());
+        args.format = OutputFormat::Json;
+        let mut buf = Vec::new();
+        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["id"], "a1");
+        assert_eq!(parsed["type"], "IMAGE");
+        assert_eq!(parsed["localPath"], "/home/u/Photos/a.jpg");
+        assert_eq!(parsed["country"], "China");
+        assert_eq!(parsed["unmapped"], false);
+        assert_eq!(parsed["missing"], false);
+        let parsed2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(parsed2["type"], "VIDEO");
+    }
+
+    #[test]
+    fn emit_table_has_header_and_aligned_columns() {
+        let assets = vec![make_asset(
+            "a1",
+            "/mnt/qnap/a.jpg",
+            "IMAGE",
+            "2025-01-01T00:00:00Z",
+        )];
+        let mut args = default_args();
+        args.query = Some("x".into());
+        args.format = OutputFormat::Table;
+        let mut buf = Vec::new();
+        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("TYPE"));
+        assert!(lines[0].contains("TAKEN"));
+        assert!(lines[0].contains("LOCATION"));
+        assert!(lines[0].contains("PATH"));
+        assert!(lines[1].contains("IMAGE"));
+        assert!(lines[1].contains("2025-01-01"));
+        assert!(lines[1].contains("Shanghai, Shanghai, China"));
+        assert!(lines[1].contains("/home/u/Photos/a.jpg"));
+    }
+}
+

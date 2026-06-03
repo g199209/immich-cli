@@ -31,6 +31,10 @@ local  = "~/QNAP-Photos"
 
 ## Usage
 
+`search` requires at least one filter (`--query`, `--taken-after`,
+`--taken-before`, `--city`, `--state`, `--country`, or `--type`); running
+it bare is rejected to avoid accidentally listing the entire library.
+
 ```bash
 # Smart (CLIP) query
 immich-cli search -q "child playing" --limit 20

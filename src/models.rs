@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Only fields we actually populate are listed; everything else is left as
 /// API defaults. `query` is required by smart search and ignored by metadata
 /// search.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
