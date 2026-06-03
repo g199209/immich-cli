@@ -1,0 +1,13 @@
+# Copy to ~/.config/immich-cli/config.toml and fill in your values.
+
+server_url = "http://your-immich-host:2283"
+api_key    = "your-immich-api-token"
+
+# One or more mappings from Immich server-side paths to local mounts.
+# The first prefix that matches an asset's originalPath wins.
+[[path_map]]
+server = "/mnt/qnap-photos"
+local  = "~/QNAP-Photos"
+
+# Optional: HTTP request timeout in seconds. Defaults to 60.
+# timeout_secs = 60
