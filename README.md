@@ -63,5 +63,8 @@ Output formats:
 - `json` — newline-delimited JSON, one object per asset.
 - `table` — aligned `TYPE / TAKEN / LOCATION / PATH`.
 
-The CLI walks Immich's pagination internally; `--limit` is the overall cap,
-`--page-size` controls how many results are pulled per HTTP round-trip.
+The CLI walks Immich's pagination internally; `--limit` is the overall cap
+(default 1000), `--page-size` controls how many results are pulled per HTTP
+round-trip (default 1000). When the server has more matches than `--limit`
+allowed through, the output ends with a `......` marker (or
+`{"truncated":true}` in `--format json`, so NDJSON stays parseable).

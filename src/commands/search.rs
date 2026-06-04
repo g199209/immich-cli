@@ -36,12 +36,13 @@ pub struct SearchArgs {
     #[arg(long, value_enum)]
     pub r#type: Option<AssetTypeArg>,
 
-    /// Maximum results to return across all pages.
-    #[arg(long, default_value_t = 250)]
+    /// Maximum results to return across all pages. When the server has more
+    /// matches than this, the output ends with a `......` marker.
+    #[arg(long, default_value_t = 1000)]
     pub limit: u32,
 
     /// Page size to request from Immich (max 1000 in current API).
-    #[arg(long, default_value_t = 250)]
+    #[arg(long, default_value_t = 1000)]
     pub page_size: u32,
 
     /// Output format.
@@ -127,14 +128,22 @@ pub fn run(cfg: &Config, args: SearchArgs) -> Result<()> {
     args.validate()?;
 
     let client = ImmichClient::new(cfg)?;
-    let assets = fetch_assets(&client, &args)?;
+    let result = fetch_assets(&client, &args)?;
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    emit_to_writer(&cfg.path_map, &args, &assets, &mut out)
+    emit_to_writer(&cfg.path_map, &args, &result, &mut out)
 }
 
-pub fn fetch_assets<B: SearchBackend>(backend: &B, args: &SearchArgs) -> Result<Vec<Asset>> {
+/// Outcome of a paginated fetch: the items we kept, plus whether the
+/// server still had more matches that we didn't retrieve.
+#[derive(Debug)]
+pub struct FetchResult {
+    pub assets: Vec<Asset>,
+    pub truncated: bool,
+}
+
+pub fn fetch_assets<B: SearchBackend>(backend: &B, args: &SearchArgs) -> Result<FetchResult> {
     let taken_after = args
         .taken_after
         .as_deref()
@@ -146,7 +155,7 @@ pub fn fetch_assets<B: SearchBackend>(backend: &B, args: &SearchArgs) -> Result<
         .map(normalize_date_end)
         .transpose()?;
 
-    let mut collected = Vec::with_capacity(args.limit as usize);
+    let mut collected: Vec<Asset> = Vec::with_capacity(args.limit as usize);
     let mut page: u32 = 1;
     let page_size = args.page_size.min(args.limit).max(1);
 
@@ -168,11 +177,18 @@ pub fn fetch_assets<B: SearchBackend>(backend: &B, args: &SearchArgs) -> Result<
         let count = resp.assets.items.len();
         let has_more = resp.assets.next_page.as_ref().is_some_and(|v| !v.is_null());
 
-        for asset in resp.assets.items {
-            collected.push(asset);
-            if collected.len() as u32 >= args.limit {
-                return Ok(collected);
-            }
+        let remaining = (args.limit as usize).saturating_sub(collected.len());
+        let take = count.min(remaining);
+        // Anything not consumed in the current page, plus a known next page,
+        // both mean there's more we're not fetching.
+        let leftover_in_page = count > take;
+        collected.extend(resp.assets.items.into_iter().take(take));
+
+        if collected.len() as u32 >= args.limit {
+            return Ok(FetchResult {
+                assets: collected,
+                truncated: leftover_in_page || has_more,
+            });
         }
 
         if !has_more || count == 0 {
@@ -180,7 +196,10 @@ pub fn fetch_assets<B: SearchBackend>(backend: &B, args: &SearchArgs) -> Result<
         }
         page += 1;
     }
-    Ok(collected)
+    Ok(FetchResult {
+        assets: collected,
+        truncated: false,
+    })
 }
 
 /// Accept either a full ISO 8601 timestamp or a bare `YYYY-MM-DD`. For the
@@ -218,9 +237,10 @@ fn normalize_date(input: &str, end_of_day: bool) -> Result<String> {
 pub fn emit_to_writer<W: std::io::Write>(
     path_map: &[PathMapEntry],
     args: &SearchArgs,
-    assets: &[Asset],
+    result: &FetchResult,
     out: &mut W,
 ) -> Result<()> {
+    let assets = &result.assets;
     let mut rows: Vec<Row> = Vec::with_capacity(assets.len());
     for asset in assets {
         let local = path_map::translate(&asset.original_path, path_map);
@@ -294,6 +314,15 @@ pub fn emit_to_writer<W: std::io::Write>(
         }
         OutputFormat::Table => {
             write_table(out, &rows)?;
+        }
+    }
+
+    if result.truncated {
+        // Signal that the server still had more matches than --limit allowed
+        // through. NDJSON output stays parseable by using a structured marker.
+        match args.format {
+            OutputFormat::Json => writeln!(out, "{}", r#"{"truncated":true}"#)?,
+            OutputFormat::Paths | OutputFormat::Table => writeln!(out, "......")?,
         }
     }
 
@@ -402,12 +431,26 @@ mod tests {
             state: None,
             country: None,
             r#type: None,
-            limit: 250,
-            page_size: 250,
+            limit: 1000,
+            page_size: 1000,
             format: OutputFormat::Paths,
             verify: false,
             include_missing: false,
             include_unmapped: false,
+        }
+    }
+
+    fn fr(assets: Vec<Asset>) -> FetchResult {
+        FetchResult {
+            assets,
+            truncated: false,
+        }
+    }
+
+    fn fr_truncated(assets: Vec<Asset>) -> FetchResult {
+        FetchResult {
+            assets,
+            truncated: true,
         }
     }
 
@@ -558,8 +601,9 @@ mod tests {
         args.page_size = 2;
         args.limit = 10;
 
-        let assets = fetch_assets(&backend, &args).unwrap();
-        assert_eq!(assets.len(), 3);
+        let got = fetch_assets(&backend, &args).unwrap();
+        assert_eq!(got.assets.len(), 3);
+        assert!(!got.truncated, "exhausted result must not be truncated");
         let calls = backend.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].page, Some(1));
@@ -585,10 +629,53 @@ mod tests {
         args.page_size = 10;
         args.limit = 2;
 
-        let assets = fetch_assets(&backend, &args).unwrap();
-        assert_eq!(assets.len(), 2);
+        let got = fetch_assets(&backend, &args).unwrap();
+        assert_eq!(got.assets.len(), 2);
+        // Leftover items in the same page mean the server still had more
+        // to give us — the marker must be raised.
+        assert!(got.truncated);
         // Only the first page should have been requested.
         assert_eq!(backend.calls().len(), 1);
+    }
+
+    #[test]
+    fn fetch_exact_limit_at_page_boundary_signals_truncated_via_next_page() {
+        // limit == items in page 1, but nextPage="2" tells us page 2 exists.
+        let backend = FakeBackend::new(vec![resp(
+            vec![
+                make_asset("a1", "/mnt/x/a.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
+                make_asset("a2", "/mnt/x/b.jpg", "IMAGE", "2025-01-02T00:00:00Z"),
+            ],
+            Some("2"),
+        )]);
+        let mut args = default_args();
+        args.country = Some("China".into());
+        args.page_size = 2;
+        args.limit = 2;
+        let got = fetch_assets(&backend, &args).unwrap();
+        assert_eq!(got.assets.len(), 2);
+        assert!(got.truncated);
+        assert_eq!(backend.calls().len(), 1);
+    }
+
+    #[test]
+    fn fetch_exact_limit_at_end_of_results_is_not_truncated() {
+        // limit == total available, and nextPage=null. Boundary case: must
+        // not raise the truncation marker.
+        let backend = FakeBackend::new(vec![resp(
+            vec![
+                make_asset("a1", "/mnt/x/a.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
+                make_asset("a2", "/mnt/x/b.jpg", "IMAGE", "2025-01-02T00:00:00Z"),
+            ],
+            None,
+        )]);
+        let mut args = default_args();
+        args.country = Some("China".into());
+        args.page_size = 2;
+        args.limit = 2;
+        let got = fetch_assets(&backend, &args).unwrap();
+        assert_eq!(got.assets.len(), 2);
+        assert!(!got.truncated);
     }
 
     #[test]
@@ -643,80 +730,80 @@ mod tests {
 
     #[test]
     fn emit_paths_default_skips_unmapped_with_warning() {
-        let assets = vec![
+        let result = fr(vec![
             make_asset("a1", "/mnt/qnap/a.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
             make_asset("a2", "/other/b.jpg", "IMAGE", "2025-01-02T00:00:00Z"),
-        ];
+        ]);
         let mut args = default_args();
         args.query = Some("x".into());
         let mut buf = Vec::new();
-        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        emit_to_writer(&pmap(), &args, &result, &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.trim(), "/home/u/Photos/a.jpg");
     }
 
     #[test]
     fn emit_paths_include_unmapped_marks_them() {
-        let assets = vec![make_asset(
+        let result = fr(vec![make_asset(
             "a2",
             "/other/b.jpg",
             "IMAGE",
             "2025-01-02T00:00:00Z",
-        )];
+        )]);
         let mut args = default_args();
         args.query = Some("x".into());
         args.include_unmapped = true;
         let mut buf = Vec::new();
-        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        emit_to_writer(&pmap(), &args, &result, &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.trim(), "UNMAPPED\t/other/b.jpg");
     }
 
     #[test]
     fn emit_paths_verify_skips_missing_files() {
-        let assets = vec![make_asset(
+        let result = fr(vec![make_asset(
             "a1",
             "/mnt/qnap/nope.jpg",
             "IMAGE",
             "2025-01-01T00:00:00Z",
-        )];
+        )]);
         let mut args = default_args();
         args.query = Some("x".into());
         args.verify = true;
         let mut buf = Vec::new();
-        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        emit_to_writer(&pmap(), &args, &result, &mut buf).unwrap();
         assert!(String::from_utf8(buf).unwrap().is_empty());
     }
 
     #[test]
     fn emit_paths_verify_with_include_missing_emits_marker() {
-        let assets = vec![make_asset(
+        let result = fr(vec![make_asset(
             "a1",
             "/mnt/qnap/nope.jpg",
             "IMAGE",
             "2025-01-01T00:00:00Z",
-        )];
+        )]);
         let mut args = default_args();
         args.query = Some("x".into());
         args.verify = true;
         args.include_missing = true;
         let mut buf = Vec::new();
-        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        emit_to_writer(&pmap(), &args, &result, &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.trim(), "MISSING\t/home/u/Photos/nope.jpg");
     }
 
     #[test]
     fn emit_json_is_ndjson() {
-        let assets = vec![
+        let result = fr(vec![
             make_asset("a1", "/mnt/qnap/a.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
             make_asset("a2", "/mnt/qnap/b.jpg", "VIDEO", "2025-01-02T00:00:00Z"),
-        ];
+        ]);
         let mut args = default_args();
         args.query = Some("x".into());
         args.format = OutputFormat::Json;
         let mut buf = Vec::new();
-        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        emit_to_writer(&pmap(), &args, &result, &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -733,17 +820,17 @@ mod tests {
 
     #[test]
     fn emit_table_has_header_and_aligned_columns() {
-        let assets = vec![make_asset(
+        let result = fr(vec![make_asset(
             "a1",
             "/mnt/qnap/a.jpg",
             "IMAGE",
             "2025-01-01T00:00:00Z",
-        )];
+        )]);
         let mut args = default_args();
         args.query = Some("x".into());
         args.format = OutputFormat::Table;
         let mut buf = Vec::new();
-        emit_to_writer(&pmap(), &args, &assets, &mut buf).unwrap();
+        emit_to_writer(&pmap(), &args, &result, &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -755,6 +842,79 @@ mod tests {
         assert!(lines[1].contains("2025-01-01"));
         assert!(lines[1].contains("Shanghai, Shanghai, China"));
         assert!(lines[1].contains("/home/u/Photos/a.jpg"));
+    }
+
+    // ---- truncation marker --------------------------------------------
+
+    #[test]
+    fn emit_paths_appends_dots_when_truncated() {
+        let result = fr_truncated(vec![make_asset(
+            "a1",
+            "/mnt/qnap/a.jpg",
+            "IMAGE",
+            "2025-01-01T00:00:00Z",
+        )]);
+        let mut args = default_args();
+        args.query = Some("x".into());
+        let mut buf = Vec::new();
+        emit_to_writer(&pmap(), &args, &result, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines, vec!["/home/u/Photos/a.jpg", "......"]);
+    }
+
+    #[test]
+    fn emit_paths_no_marker_when_not_truncated() {
+        let result = fr(vec![make_asset(
+            "a1",
+            "/mnt/qnap/a.jpg",
+            "IMAGE",
+            "2025-01-01T00:00:00Z",
+        )]);
+        let mut args = default_args();
+        args.query = Some("x".into());
+        let mut buf = Vec::new();
+        emit_to_writer(&pmap(), &args, &result, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.contains("......"), "got: {out}");
+    }
+
+    #[test]
+    fn emit_table_appends_dots_when_truncated() {
+        let result = fr_truncated(vec![make_asset(
+            "a1",
+            "/mnt/qnap/a.jpg",
+            "IMAGE",
+            "2025-01-01T00:00:00Z",
+        )]);
+        let mut args = default_args();
+        args.query = Some("x".into());
+        args.format = OutputFormat::Table;
+        let mut buf = Vec::new();
+        emit_to_writer(&pmap(), &args, &result, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let last_line = out.lines().last().unwrap();
+        assert_eq!(last_line, "......");
+    }
+
+    #[test]
+    fn emit_json_truncation_marker_is_parseable() {
+        let result = fr_truncated(vec![make_asset(
+            "a1",
+            "/mnt/qnap/a.jpg",
+            "IMAGE",
+            "2025-01-01T00:00:00Z",
+        )]);
+        let mut args = default_args();
+        args.query = Some("x".into());
+        args.format = OutputFormat::Json;
+        let mut buf = Vec::new();
+        emit_to_writer(&pmap(), &args, &result, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let marker: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(marker["truncated"], true);
     }
 }
 
