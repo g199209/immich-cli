@@ -31,6 +31,8 @@ local  = "~/QNAP-Photos"
 
 ## Usage
 
+### `search`
+
 `search` requires at least one filter (`--query`, `--taken-after`,
 `--taken-before`, `--city`, `--state`, `--country`, or `--type`); running
 it bare — or with only empty/whitespace flag values — is rejected to
@@ -69,3 +71,30 @@ The CLI walks Immich's pagination internally; `--limit` is the overall cap
 When the server has more matches than `--limit` allowed through, the
 output ends with a `......` marker (or `{"truncated":true}` in
 `--format json`, so NDJSON stays parseable).
+
+### `info`
+
+`info` takes the **local NFS path** of a photo or video and prints
+everything Immich knows about it: file info, taken/modified times, GPS
+location, camera/EXIF, recognized people and faces, tags, albums, and
+the Immich-internal fields (visibility, favorite, owner, checksum,
+description, duplicate id, stack, etc.).
+
+```bash
+# Default: structured text, readable by humans, LLMs, and grep
+immich-cli info ~/QNAP-Photos/PYL/2018年/IMG_20180908_185429.jpg
+
+# Full raw asset detail as pretty JSON, for automation
+immich-cli info ~/QNAP-Photos/PYL/2018年/IMG_20180908_185429.jpg --format json | \
+    jq '{id, localPath, lat: .exifInfo.latitude, people: [.people[].name]}'
+```
+
+The text format groups data under `File`, `Times`, `Location`, `Camera`,
+`People`, `Tags`, `Albums`, and `Immich` sections. Each `Key: value` pair
+is indented under its section so a quick `grep -A1 '^Location'` or
+similar pattern-match works for both shell pipelines and LLMs scanning
+the output.
+
+The JSON format is the full `/api/assets/{id}` body plus a top-level
+`localPath` (the resolved NFS path) and `albums` (the asset's albums).
+Nothing is dropped, so it's safe to query for anything Immich exposes.

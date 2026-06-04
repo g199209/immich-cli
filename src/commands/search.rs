@@ -194,6 +194,7 @@ fn fetch_assets_inner<B: SearchBackend>(
     loop {
         let req = SearchRequest {
             query: query.clone(),
+            original_file_name: None,
             city: city.clone(),
             state: state.clone(),
             country: country.clone(),
@@ -509,18 +510,7 @@ mod tests {
 
     impl SearchBackend for FakeBackend {
         fn search(&self, req: &SearchRequest) -> Result<SearchResponse> {
-            self.calls.borrow_mut().push(SearchRequest {
-                query: req.query.clone(),
-                city: req.city.clone(),
-                state: req.state.clone(),
-                country: req.country.clone(),
-                taken_after: req.taken_after.clone(),
-                taken_before: req.taken_before.clone(),
-                asset_type: req.asset_type.clone(),
-                page: req.page,
-                size: req.size,
-                with_exif: req.with_exif,
-            });
+            self.calls.borrow_mut().push(req.clone());
             let mut q = self.responses.borrow_mut();
             if q.is_empty() {
                 anyhow::bail!("FakeBackend ran out of canned responses");

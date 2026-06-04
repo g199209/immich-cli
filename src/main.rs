@@ -22,6 +22,8 @@ struct Cli {
 enum Command {
     /// Search assets by smart query, time range, and/or geo location
     Search(commands::search::SearchArgs),
+    /// Show all available metadata for a single photo, given its local NFS path
+    Info(commands::info::InfoArgs),
 }
 
 fn main() -> Result<()> {
@@ -30,5 +32,6 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Search(args) => commands::search::run(&cfg, args),
+        Command::Info(args) => commands::info::run(&cfg, args),
     }
 }

@@ -11,6 +11,11 @@ pub struct SearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
 
+    /// Exact-match filter on `originalFileName`. Used by the `info`
+    /// subcommand to locate an asset given its on-disk path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_file_name: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub city: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -9,6 +9,19 @@ pub trait SearchBackend {
     fn search(&self, req: &SearchRequest) -> Result<SearchResponse>;
 }
 
+/// Backend the `info` subcommand talks to. Separate from `SearchBackend`
+/// because info needs raw asset+album JSON and would otherwise force every
+/// fake search backend in the suite to implement these too.
+pub trait InfoBackend {
+    /// `GET /api/assets/{id}` — full asset detail, including EXIF, people,
+    /// faces, tags, stack, duplicate id, etc. Returned as raw JSON so we
+    /// stay forward-compatible with new Immich fields.
+    fn get_asset(&self, id: &str) -> Result<serde_json::Value>;
+
+    /// `GET /api/albums?assetId={id}` — list of albums the asset belongs to.
+    fn albums_for_asset(&self, id: &str) -> Result<serde_json::Value>;
+}
+
 pub struct ImmichClient {
     base_url: String,
     http: reqwest::blocking::Client,
@@ -89,4 +102,44 @@ impl SearchBackend for ImmichClient {
             .with_context(|| format!("failed to decode response from {url}"))?;
         Ok(parsed)
     }
+}
+
+impl InfoBackend for ImmichClient {
+    fn get_asset(&self, id: &str) -> Result<serde_json::Value> {
+        self.get_json(&format!("/api/assets/{id}"))
+    }
+
+    fn albums_for_asset(&self, id: &str) -> Result<serde_json::Value> {
+        // assetId is passed as a query parameter; reqwest handles encoding.
+        let url = format!("{}/api/albums", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("assetId", id)])
+            .send()
+            .with_context(|| format!("HTTP GET {url}?assetId={id} failed"))?;
+        unpack_json(resp, &url)
+    }
+}
+
+impl ImmichClient {
+    fn get_json(&self, path: &str) -> Result<serde_json::Value> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .with_context(|| format!("HTTP GET {url} failed"))?;
+        unpack_json(resp, &url)
+    }
+}
+
+fn unpack_json(resp: reqwest::blocking::Response, url: &str) -> Result<serde_json::Value> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        bail!("Immich returned {status} for {url}: {body}");
+    }
+    resp.json()
+        .with_context(|| format!("failed to decode JSON response from {url}"))
 }
