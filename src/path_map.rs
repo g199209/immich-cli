@@ -35,7 +35,10 @@ mod tests {
     use super::*;
 
     fn entry(server: &str, local: &str) -> PathMapEntry {
-        PathMapEntry { server: server.into(), local: local.into() }
+        PathMapEntry {
+            server: server.into(),
+            local: local.into(),
+        }
     }
 
     #[test]

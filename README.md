@@ -33,7 +33,8 @@ local  = "~/QNAP-Photos"
 
 `search` requires at least one filter (`--query`, `--taken-after`,
 `--taken-before`, `--city`, `--state`, `--country`, or `--type`); running
-it bare is rejected to avoid accidentally listing the entire library.
+it bare — or with only empty/whitespace flag values — is rejected to
+avoid accidentally listing the entire library.
 
 ```bash
 # Smart (CLIP) query
@@ -64,7 +65,7 @@ Output formats:
 - `table` — aligned `TYPE / TAKEN / LOCATION / PATH`.
 
 The CLI walks Immich's pagination internally; `--limit` is the overall cap
-(default 1000), `--page-size` controls how many results are pulled per HTTP
-round-trip (default 1000). When the server has more matches than `--limit`
-allowed through, the output ends with a `......` marker (or
-`{"truncated":true}` in `--format json`, so NDJSON stays parseable).
+(default 1000). Per-request page size is hard-coded to the API maximum.
+When the server has more matches than `--limit` allowed through, the
+output ends with a `......` marker (or `{"truncated":true}` in
+`--format json`, so NDJSON stays parseable).

@@ -42,9 +42,7 @@ impl MockServer {
         F: Fn(&CapturedRequest) -> (u16, &'static str, String) + Send + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind localhost");
-        listener
-            .set_nonblocking(false)
-            .expect("blocking listener");
+        listener.set_nonblocking(false).expect("blocking listener");
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{}", addr);
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -61,9 +59,7 @@ impl MockServer {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(2)))
-                            .ok();
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                         let req = match read_request(&mut stream) {
                             Ok(r) => r,
                             Err(_) => continue,

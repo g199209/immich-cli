@@ -41,10 +41,6 @@ pub struct SearchArgs {
     #[arg(long, default_value_t = 1000)]
     pub limit: u32,
 
-    /// Page size to request from Immich (max 1000 in current API).
-    #[arg(long, default_value_t = 1000)]
-    pub page_size: u32,
-
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Paths)]
     pub format: OutputFormat,
@@ -97,22 +93,24 @@ impl SearchArgs {
     /// Returns true if at least one user-facing filter is set. We reject
     /// "empty" searches because dumping the entire library at random is
     /// almost certainly not what the caller intended.
+    ///
+    /// A whitespace-only string filter (e.g. `--query ""`, `--country " "`)
+    /// is treated as if the flag was not passed at all — otherwise the
+    /// caller could trivially bypass the "must filter" guard with an empty
+    /// flag and dump the whole library.
     pub fn has_filter(&self) -> bool {
-        self.query.is_some()
-            || self.taken_after.is_some()
-            || self.taken_before.is_some()
-            || self.city.is_some()
-            || self.state.is_some()
-            || self.country.is_some()
+        non_blank(&self.query)
+            || non_blank(&self.taken_after)
+            || non_blank(&self.taken_before)
+            || non_blank(&self.city)
+            || non_blank(&self.state)
+            || non_blank(&self.country)
             || self.r#type.is_some()
     }
 
     pub fn validate(&self) -> Result<()> {
         if self.limit == 0 {
             bail!("--limit must be > 0");
-        }
-        if self.page_size == 0 {
-            bail!("--page-size must be > 0");
         }
         if !self.has_filter() {
             bail!(
@@ -122,6 +120,25 @@ impl SearchArgs {
         }
         Ok(())
     }
+}
+
+/// `true` only when the option holds a non-empty, non-whitespace string.
+/// Empty/whitespace clones of "set" are not real filters and must not count
+/// toward the "at least one filter" requirement.
+fn non_blank(opt: &Option<String>) -> bool {
+    opt.as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Same idea as `non_blank`, but returns the trimmed string for sending to
+/// Immich, or `None` if the input is missing/blank. Use this when building
+/// the API request so we never send `"city": ""` over the wire.
+fn cleaned(opt: &Option<String>) -> Option<String> {
+    opt.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 pub fn run(cfg: &Config, args: SearchArgs) -> Result<()> {
@@ -143,28 +160,43 @@ pub struct FetchResult {
     pub truncated: bool,
 }
 
+/// Per-request page size for Immich's search endpoints. 1000 is the API's
+/// documented maximum, so it's also the fewest round-trips we can make for
+/// the default --limit of 1000.
+const PAGE_SIZE: u32 = 1000;
+
 pub fn fetch_assets<B: SearchBackend>(backend: &B, args: &SearchArgs) -> Result<FetchResult> {
-    let taken_after = args
-        .taken_after
+    fetch_assets_inner(backend, args, PAGE_SIZE)
+}
+
+fn fetch_assets_inner<B: SearchBackend>(
+    backend: &B,
+    args: &SearchArgs,
+    page_size: u32,
+) -> Result<FetchResult> {
+    let taken_after = cleaned(&args.taken_after)
         .as_deref()
         .map(normalize_date_start)
         .transpose()?;
-    let taken_before = args
-        .taken_before
+    let taken_before = cleaned(&args.taken_before)
         .as_deref()
         .map(normalize_date_end)
         .transpose()?;
+    let query = cleaned(&args.query);
+    let city = cleaned(&args.city);
+    let state = cleaned(&args.state);
+    let country = cleaned(&args.country);
 
     let mut collected: Vec<Asset> = Vec::with_capacity(args.limit as usize);
     let mut page: u32 = 1;
-    let page_size = args.page_size.min(args.limit).max(1);
+    let page_size = page_size.min(args.limit).max(1);
 
     loop {
         let req = SearchRequest {
-            query: args.query.clone(),
-            city: args.city.clone(),
-            state: args.state.clone(),
-            country: args.country.clone(),
+            query: query.clone(),
+            city: city.clone(),
+            state: state.clone(),
+            country: country.clone(),
             taken_after: taken_after.clone(),
             taken_before: taken_before.clone(),
             asset_type: args.r#type.map(|t| t.as_api_str().to_string()),
@@ -215,6 +247,9 @@ pub fn normalize_date_end(input: &str) -> Result<String> {
 
 fn normalize_date(input: &str, end_of_day: bool) -> Result<String> {
     let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("date filter is empty");
+    }
     if trimmed.len() == 10 && trimmed.chars().nth(4) == Some('-') {
         let date = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
             .with_context(|| format!("invalid date `{trimmed}`, expected YYYY-MM-DD"))?;
@@ -321,7 +356,7 @@ pub fn emit_to_writer<W: std::io::Write>(
         // Signal that the server still had more matches than --limit allowed
         // through. NDJSON output stays parseable by using a structured marker.
         match args.format {
-            OutputFormat::Json => writeln!(out, "{}", r#"{"truncated":true}"#)?,
+            OutputFormat::Json => writeln!(out, "{{\"truncated\":true}}")?,
             OutputFormat::Paths | OutputFormat::Table => writeln!(out, "......")?,
         }
     }
@@ -432,7 +467,6 @@ mod tests {
             country: None,
             r#type: None,
             limit: 1000,
-            page_size: 1000,
             format: OutputFormat::Paths,
             verify: false,
             include_missing: false,
@@ -546,11 +580,45 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_page_size() {
+    fn validate_rejects_empty_string_query() {
+        // -q "" must not slip past the "at least one filter" guard.
         let mut args = default_args();
-        args.query = Some("x".into());
-        args.page_size = 0;
-        assert!(args.validate().is_err());
+        args.query = Some(String::new());
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("at least one filter"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_country() {
+        let mut args = default_args();
+        args.country = Some("   ".into());
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("at least one filter"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_date() {
+        let mut args = default_args();
+        args.taken_after = Some(" ".into());
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("at least one filter"), "got: {err}");
+    }
+
+    #[test]
+    fn blank_strings_are_not_sent_over_the_wire() {
+        // If a real filter is set, any *other* string flag that happens to
+        // be blank must be stripped from the request body — never sent as
+        // an empty match Immich would interpret literally.
+        let backend = FakeBackend::new(vec![resp(vec![], None)]);
+        let mut args = default_args();
+        args.country = Some("China".into());
+        args.city = Some("   ".into());
+        args.query = Some("".into());
+        fetch_assets(&backend, &args).unwrap();
+        let req = &backend.calls()[0];
+        assert_eq!(req.country.as_deref(), Some("China"));
+        assert!(req.city.is_none(), "blank city should be stripped");
+        assert!(req.query.is_none(), "blank query should be stripped");
     }
 
     // ---- Date normalization --------------------------------------------
@@ -592,16 +660,22 @@ mod tests {
                 Some("2"),
             ),
             resp(
-                vec![make_asset("a3", "/mnt/x/c.jpg", "IMAGE", "2025-01-03T00:00:00Z")],
+                vec![make_asset(
+                    "a3",
+                    "/mnt/x/c.jpg",
+                    "IMAGE",
+                    "2025-01-03T00:00:00Z",
+                )],
                 None,
             ),
         ]);
         let mut args = default_args();
         args.query = Some("anything".into());
-        args.page_size = 2;
         args.limit = 10;
 
-        let got = fetch_assets(&backend, &args).unwrap();
+        // page_size is hard-coded in fetch_assets, so drive the inner
+        // entry point directly to exercise multi-page behavior.
+        let got = fetch_assets_inner(&backend, &args, 2).unwrap();
         assert_eq!(got.assets.len(), 3);
         assert!(!got.truncated, "exhausted result must not be truncated");
         let calls = backend.calls();
@@ -626,10 +700,9 @@ mod tests {
         )]);
         let mut args = default_args();
         args.country = Some("China".into());
-        args.page_size = 10;
         args.limit = 2;
 
-        let got = fetch_assets(&backend, &args).unwrap();
+        let got = fetch_assets_inner(&backend, &args, 10).unwrap();
         assert_eq!(got.assets.len(), 2);
         // Leftover items in the same page mean the server still had more
         // to give us — the marker must be raised.
@@ -650,9 +723,8 @@ mod tests {
         )]);
         let mut args = default_args();
         args.country = Some("China".into());
-        args.page_size = 2;
         args.limit = 2;
-        let got = fetch_assets(&backend, &args).unwrap();
+        let got = fetch_assets_inner(&backend, &args, 2).unwrap();
         assert_eq!(got.assets.len(), 2);
         assert!(got.truncated);
         assert_eq!(backend.calls().len(), 1);
@@ -671,9 +743,8 @@ mod tests {
         )]);
         let mut args = default_args();
         args.country = Some("China".into());
-        args.page_size = 2;
         args.limit = 2;
-        let got = fetch_assets(&backend, &args).unwrap();
+        let got = fetch_assets_inner(&backend, &args, 2).unwrap();
         assert_eq!(got.assets.len(), 2);
         assert!(!got.truncated);
     }
@@ -917,4 +988,3 @@ mod tests {
         assert_eq!(marker["truncated"], true);
     }
 }
-

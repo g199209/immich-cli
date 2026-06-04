@@ -63,7 +63,7 @@ fn default_config_path() -> Result<PathBuf> {
 
 fn expand_tilde(input: &str) -> String {
     if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = directories::UserDirs::new().and_then(|d| Some(d.home_dir().to_path_buf())) {
+        if let Some(home) = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()) {
             return home.join(rest).to_string_lossy().into_owned();
         }
     }
