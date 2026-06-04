@@ -90,11 +90,17 @@ immich-cli info ~/QNAP-Photos/PYL/2018年/IMG_20180908_185429.jpg --format json 
 ```
 
 The text format groups data under `File`, `Times`, `Location`, `Camera`,
-`People`, `Tags`, `Albums`, and `Immich` sections. Each `Key: value` pair
-is indented under its section so a quick `grep -A1 '^Location'` or
-similar pattern-match works for both shell pipelines and LLMs scanning
-the output.
+`People`, `Tags`, `OCR`, `Albums`, and `Immich` sections. Each
+`Key: value` pair is indented under its section so a quick
+`grep -A1 '^Location'` or similar pattern-match works for both shell
+pipelines and LLMs scanning the output.
 
-The JSON format is the full `/api/assets/{id}` body plus a top-level
-`localPath` (the resolved NFS path) and `albums` (the asset's albums).
-Nothing is dropped, so it's safe to query for anything Immich exposes.
+OCR text regions (when the server has OCR enabled) are listed with a
+`[NN%] text` prefix so you can skim or grep by confidence. The raw
+4-corner bounding boxes, both scores, and the visibility flag are
+preserved in `--format json`.
+
+The JSON format is the full `/api/assets/{id}` body plus three
+top-level fields we add: `localPath` (resolved NFS path), `albums`
+(membership list), and `ocr` (text regions). Nothing is dropped, so
+it's safe to query for anything Immich exposes.

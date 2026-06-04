@@ -60,20 +60,26 @@ where
     let albums = info
         .albums_for_asset(&asset_id)
         .unwrap_or(Value::Array(vec![]));
+    // OCR may be absent on older Immich servers — silently treat as empty so
+    // we don't fail the whole `info` call when only this extra is missing.
+    let ocr = info
+        .ocr_for_asset(&asset_id)
+        .unwrap_or(Value::Array(vec![]));
 
     // Augment the asset JSON with the inputs the caller cares about: where
-    // the file lives locally, and the album list (a separate endpoint).
+    // the file lives locally, plus the album and OCR side-data.
     if let Some(obj) = asset.as_object_mut() {
         obj.insert(
             "localPath".into(),
             Value::String(local_path.to_string_lossy().into_owned()),
         );
         obj.insert("albums".into(), albums.clone());
+        obj.insert("ocr".into(), ocr.clone());
     }
 
     match args.format {
         OutputFormat::Json => emit_json(out, &asset),
-        OutputFormat::Text => emit_text(out, &asset, &local_path, &server_path, &albums),
+        OutputFormat::Text => emit_text(out, &asset, &local_path, &server_path, &albums, &ocr),
     }
 }
 
@@ -156,6 +162,7 @@ fn emit_text<W: std::io::Write>(
     local_path: &Path,
     server_path: &str,
     albums: &Value,
+    ocr: &Value,
 ) -> Result<()> {
     let mut s = Section::new(out);
 
@@ -299,6 +306,28 @@ fn emit_text<W: std::io::Write>(
                 .or_else(|| as_str(&t["name"]))
                 .unwrap_or_default();
             s.line(&format!("  - {name}"))?;
+        }
+    }
+
+    // OCR-detected text. The `[NN%]` confidence prefix lets a reader (or
+    // grep, or an LLM) cheaply filter out low-confidence noise.
+    let ocr_entries = ocr.as_array().cloned().unwrap_or_default();
+    s.heading(&format!("OCR ({} regions)", ocr_entries.len()))?;
+    if ocr_entries.is_empty() {
+        s.line("  (none)")?;
+    } else {
+        for entry in &ocr_entries {
+            let text = as_nonempty_str(&entry["text"]).unwrap_or_default();
+            let score = entry["textScore"]
+                .as_f64()
+                .map(|v| format!("[{:3.0}%] ", (v * 100.0).round()))
+                .unwrap_or_default();
+            let hidden = if entry["isVisible"].as_bool() == Some(false) {
+                " (hidden)"
+            } else {
+                ""
+            };
+            s.line(&format!("  - {score}{text}{hidden}"))?;
         }
     }
 
@@ -511,6 +540,16 @@ mod tests {
     struct FakeInfo {
         asset: serde_json::Value,
         albums: serde_json::Value,
+        ocr: serde_json::Value,
+    }
+    impl Default for FakeInfo {
+        fn default() -> Self {
+            Self {
+                asset: Value::Null,
+                albums: serde_json::json!([]),
+                ocr: serde_json::json!([]),
+            }
+        }
     }
     impl InfoBackend for FakeInfo {
         fn get_asset(&self, _id: &str) -> Result<serde_json::Value> {
@@ -518,6 +557,9 @@ mod tests {
         }
         fn albums_for_asset(&self, _id: &str) -> Result<serde_json::Value> {
             Ok(self.albums.clone())
+        }
+        fn ocr_for_asset(&self, _id: &str) -> Result<serde_json::Value> {
+            Ok(self.ocr.clone())
         }
     }
 
@@ -705,12 +747,22 @@ mod tests {
     }
 
     fn run_collecting(cfg: &Config, asset: Value, format: OutputFormat) -> String {
+        run_collecting_with_ocr(cfg, asset, serde_json::json!([]), format)
+    }
+
+    fn run_collecting_with_ocr(
+        cfg: &Config,
+        asset: Value,
+        ocr: Value,
+        format: OutputFormat,
+    ) -> String {
         let server_path = asset["originalPath"].as_str().unwrap().to_owned();
         let local_path = "/home/u/Photos/PYL/2018/IMG_20180908_185429.jpg";
         let search = FakeSearch::new(vec![search_hit("asset-1", &server_path)]);
         let info = FakeInfo {
             asset,
             albums: serde_json::json!([]),
+            ocr,
         };
         let mut buf = Vec::new();
         run_with(
@@ -737,6 +789,7 @@ mod tests {
             "Camera",
             "People (2)",
             "Tags (2)",
+            "OCR (0 regions)",
             "Albums (0)",
             "Immich",
         ] {
@@ -745,6 +798,69 @@ mod tests {
                 "missing heading `{heading}` in:\n{out}"
             );
         }
+    }
+
+    fn sample_ocr() -> Value {
+        serde_json::json!([
+            {
+                "id": "o1", "assetId": "asset-1",
+                "x1": 0.1, "y1": 0.1, "x2": 0.3, "y2": 0.1,
+                "x3": 0.3, "y3": 0.2, "x4": 0.1, "y4": 0.2,
+                "boxScore": 0.88, "textScore": 0.99,
+                "text": "DELL", "isVisible": true
+            },
+            {
+                "id": "o2", "assetId": "asset-1",
+                "x1": 0.1, "y1": 0.3, "x2": 0.8, "y2": 0.3,
+                "x3": 0.8, "y3": 0.4, "x4": 0.1, "y4": 0.4,
+                "boxScore": 0.7, "textScore": 0.85,
+                "text": "浙江大学 电气工程学院", "isVisible": true
+            },
+            {
+                "id": "o3", "assetId": "asset-1",
+                "x1": 0.0, "y1": 0.0, "x2": 0.1, "y2": 0.0,
+                "x3": 0.1, "y3": 0.1, "x4": 0.0, "y4": 0.1,
+                "boxScore": 0.5, "textScore": 0.41,
+                "text": "low-conf", "isVisible": false
+            }
+        ])
+    }
+
+    #[test]
+    fn text_output_renders_ocr_with_confidence_and_hidden_flag() {
+        let out = run_collecting_with_ocr(&cfg(), sample_asset(), sample_ocr(), OutputFormat::Text);
+        assert!(
+            out.contains("OCR (3 regions)"),
+            "missing OCR heading in:\n{out}"
+        );
+        // Confidence is rendered as `[NN%]` prefix; helps grep / skim.
+        assert!(
+            out.contains("[ 99%] DELL"),
+            "missing high-confidence OCR entry in:\n{out}"
+        );
+        assert!(
+            out.contains("[ 85%] 浙江大学 电气工程学院"),
+            "missing unicode OCR text in:\n{out}"
+        );
+        // Hidden (filtered) text is marked so callers can spot moderated data.
+        assert!(
+            out.contains("[ 41%] low-conf (hidden)"),
+            "missing hidden marker in:\n{out}"
+        );
+    }
+
+    #[test]
+    fn json_output_includes_ocr_array_verbatim() {
+        let out = run_collecting_with_ocr(&cfg(), sample_asset(), sample_ocr(), OutputFormat::Json);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let entries = parsed["ocr"].as_array().expect("ocr must be an array");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["text"], "DELL");
+        assert_eq!(entries[1]["text"], "浙江大学 电气工程学院");
+        // Bounding-box coords round-trip untouched — automation may want
+        // them, and we never pretend to interpret them.
+        assert_eq!(entries[0]["x1"], 0.1);
+        assert_eq!(entries[2]["isVisible"], false);
     }
 
     #[test]
@@ -838,7 +954,7 @@ mod tests {
         let search = FakeSearch::new(vec![]);
         let info = FakeInfo {
             asset,
-            albums: serde_json::json!([]),
+            ..Default::default()
         };
         let mut buf = Vec::new();
         let err = run_with(

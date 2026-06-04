@@ -20,6 +20,13 @@ pub trait InfoBackend {
 
     /// `GET /api/albums?assetId={id}` — list of albums the asset belongs to.
     fn albums_for_asset(&self, id: &str) -> Result<serde_json::Value>;
+
+    /// `GET /api/assets/{id}/ocr` — list of OCR text regions. Each entry has
+    /// the recognized `text`, a normalized 4-corner box (x1,y1 .. x4,y4),
+    /// per-box and per-text confidence scores, and an `isVisible` flag.
+    /// Returns an empty array when the asset has no detected text or when
+    /// OCR is disabled server-side.
+    fn ocr_for_asset(&self, id: &str) -> Result<serde_json::Value>;
 }
 
 pub struct ImmichClient {
@@ -119,6 +126,10 @@ impl InfoBackend for ImmichClient {
             .send()
             .with_context(|| format!("HTTP GET {url}?assetId={id} failed"))?;
         unpack_json(resp, &url)
+    }
+
+    fn ocr_for_asset(&self, id: &str) -> Result<serde_json::Value> {
+        self.get_json(&format!("/api/assets/{id}/ocr"))
     }
 }
 
