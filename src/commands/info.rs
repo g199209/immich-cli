@@ -187,11 +187,17 @@ fn emit_text<W: std::io::Write>(
 
     s.heading("Time")?;
     // Single time, always wall-clock at the photo's location (GPS-derived,
-    // or device EXIF zone if no GPS). Not the current machine's TZ.
-    s.kv_opt(
-        "File created",
-        as_str(&asset["localDateTime"]).map(humanize_naive_iso),
-    )?;
+    // or device EXIF zone if no GPS). Not the current machine's TZ. The
+    // EXIF time zone is appended so the reader knows what "local" refers
+    // to — Immich reports it as either an IANA name (Asia/Shanghai) or a
+    // UTC offset (UTC+8), and we pass it through verbatim.
+    if let Some(naive) = as_str(&asset["localDateTime"]).map(humanize_naive_iso) {
+        let value = match as_nonempty_str(&asset["exifInfo"]["timeZone"]) {
+            Some(tz) => format!("{naive} ({tz})"),
+            None => naive,
+        };
+        s.kv("File created", value)?;
+    }
 
     let has_location =
         asset["exifInfo"]["latitude"].is_number() || asset["exifInfo"]["longitude"].is_number();
@@ -829,11 +835,10 @@ mod tests {
     }
 
     #[test]
-    fn time_section_has_single_local_line_no_zone_suffix() {
+    fn time_section_has_single_local_line_with_tz_in_parens() {
         // Only one time is shown — File created — in the photo's local
-        // wall-clock time. Other times (original UTC, file mtime, indexed
-        // at, last updated) are intentionally dropped; they're still
-        // available via --format json.
+        // wall-clock time, followed by the EXIF time zone in parens so
+        // the reader knows which zone "local" means.
         let out = run_collecting(&cfg(), sample_asset(), OutputFormat::Text);
         let time_block: Vec<&str> = out
             .lines()
@@ -844,11 +849,25 @@ mod tests {
         assert_eq!(time_block.len(), 1, "got: {time_block:?}");
         let line = time_block[0];
         assert!(line.contains("File created"), "got: {line}");
-        assert!(line.contains("2018-09-08 18:54:29"), "got: {line}");
-        // Wall-clock at photo location, not a UTC moment — no zone label.
         assert!(
-            !line.contains("UTC") && !line.contains("+"),
-            "local wall-clock must not carry a zone label: {line}"
+            line.contains("2018-09-08 18:54:29 (Asia/Shanghai)"),
+            "got: {line}"
+        );
+    }
+
+    #[test]
+    fn time_section_omits_tz_parens_when_absent() {
+        let mut asset = sample_asset();
+        asset["exifInfo"]["timeZone"] = serde_json::Value::Null;
+        let out = run_collecting(&cfg(), asset, OutputFormat::Text);
+        let line = out
+            .lines()
+            .find(|l| l.contains("File created"))
+            .expect("missing File created line");
+        assert!(line.contains("2018-09-08 18:54:29"), "got: {line}");
+        assert!(
+            !line.contains('('),
+            "no parens should be shown when TZ is unknown: {line}"
         );
     }
 
