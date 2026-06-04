@@ -78,8 +78,63 @@ where
     }
 
     match args.format {
-        OutputFormat::Json => emit_json(out, &asset),
+        OutputFormat::Json => {
+            prune_for_json(&mut asset);
+            emit_json(out, &asset)
+        }
         OutputFormat::Text => emit_text(out, &asset, &albums, &ocr),
+    }
+}
+
+/// Strip bookkeeping fields from the JSON payload so `--format json`
+/// surfaces the same content the text format does. Whitelist over
+/// denylist: when Immich adds new fields they're silently dropped
+/// until we decide they're meaningful. The text format keeps the same
+/// fields, so the two outputs stay in sync.
+fn prune_for_json(asset: &mut Value) {
+    const TOP_KEEP: &[&str] = &[
+        // CLI-added.
+        "localPath",
+        "albums",
+        "ocr",
+        // Content we surface in text.
+        "localDateTime",
+        "originalMimeType",
+        "width",
+        "height",
+        "duration",
+        "exifInfo",
+        "people",
+        "unassignedFaces",
+        "tags",
+    ];
+    const EXIF_KEEP: &[&str] = &[
+        // Time zone for the local wall-clock time.
+        "timeZone",
+        // GPS + reverse-geocoded location.
+        "latitude",
+        "longitude",
+        "city",
+        "state",
+        "country",
+        // Camera.
+        "make",
+        "model",
+        "lensModel",
+        "fNumber",
+        "focalLength",
+        "iso",
+        "exposureTime",
+        "orientation",
+        "projectionType",
+        // File size.
+        "fileSizeInByte",
+    ];
+    if let Some(obj) = asset.as_object_mut() {
+        obj.retain(|k, _| TOP_KEEP.contains(&k.as_str()));
+        if let Some(exif) = obj.get_mut("exifInfo").and_then(|v| v.as_object_mut()) {
+            exif.retain(|k, _| EXIF_KEEP.contains(&k.as_str()));
+        }
     }
 }
 
@@ -872,18 +927,81 @@ mod tests {
     }
 
     #[test]
-    fn json_output_includes_local_path_and_albums() {
+    fn json_output_keeps_meaningful_fields() {
         let out = run_collecting(&cfg(), sample_asset(), OutputFormat::Json);
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             parsed["localPath"],
             "/home/u/Photos/PYL/2018/IMG_20180908_185429.jpg"
         );
-        assert_eq!(
-            parsed["originalPath"],
-            "/mnt/qnap/PYL/2018/IMG_20180908_185429.jpg"
-        );
         assert!(parsed["albums"].is_array());
+        assert_eq!(parsed["originalMimeType"], "image/jpeg");
+        assert_eq!(parsed["width"], 4032);
+        assert_eq!(parsed["height"], 3024);
+        assert_eq!(parsed["localDateTime"], "2018-09-08T18:54:29.000Z");
+        // EXIF whitelist: location + camera kept, raw EXIF bookkeeping gone.
+        let exif = &parsed["exifInfo"];
+        assert_eq!(exif["latitude"], 31.1269);
+        assert_eq!(exif["country"], "People's Republic of China");
+        assert_eq!(exif["make"], "HONOR");
+        assert_eq!(exif["fNumber"], 4);
+        assert_eq!(exif["timeZone"], "Asia/Shanghai");
+        assert_eq!(exif["fileSizeInByte"], 2_741_923);
+        // People/tags arrays untouched.
+        assert!(parsed["people"].is_array());
+        assert!(parsed["tags"].is_array());
+    }
+
+    #[test]
+    fn json_output_drops_bookkeeping_top_level_fields() {
+        let out = run_collecting(&cfg(), sample_asset(), OutputFormat::Json);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        for k in [
+            "id",
+            "originalPath",
+            "originalFileName",
+            "type",
+            "owner",
+            "ownerId",
+            "libraryId",
+            "deviceId",
+            "deviceAssetId",
+            "visibility",
+            "isFavorite",
+            "isArchived",
+            "isTrashed",
+            "isOffline",
+            "isEdited",
+            "hasMetadata",
+            "thumbhash",
+            "checksum",
+            "createdAt",
+            "updatedAt",
+            "fileCreatedAt",
+            "fileModifiedAt",
+            "duplicateId",
+            "stack",
+            "livePhotoVideoId",
+        ] {
+            assert!(parsed.get(k).is_none(), "expected `{k}` to be pruned");
+        }
+    }
+
+    #[test]
+    fn json_output_drops_bookkeeping_exif_fields() {
+        let out = run_collecting(&cfg(), sample_asset(), OutputFormat::Json);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let exif = parsed["exifInfo"].as_object().unwrap();
+        for k in [
+            "dateTimeOriginal",
+            "modifyDate",
+            "description",
+            "rating",
+            "exifImageWidth",
+            "exifImageHeight",
+        ] {
+            assert!(exif.get(k).is_none(), "expected exif.{k} to be pruned");
+        }
     }
 
     #[test]
