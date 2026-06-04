@@ -79,7 +79,7 @@ where
 
     match args.format {
         OutputFormat::Json => emit_json(out, &asset),
-        OutputFormat::Text => emit_text(out, &asset, &local_path, &server_path, &albums, &ocr),
+        OutputFormat::Text => emit_text(out, &asset, &albums, &ocr),
     }
 }
 
@@ -159,18 +159,12 @@ fn emit_json<W: std::io::Write>(out: &mut W, asset: &Value) -> Result<()> {
 fn emit_text<W: std::io::Write>(
     out: &mut W,
     asset: &Value,
-    local_path: &Path,
-    server_path: &str,
     albums: &Value,
     ocr: &Value,
 ) -> Result<()> {
     let mut s = Section::new(out);
 
     s.heading("File")?;
-    s.kv("Local path", local_path.display().to_string())?;
-    s.kv("Server path", server_path)?;
-    s.kv_opt("Filename", as_str(&asset["originalFileName"]))?;
-    s.kv_opt("Type", as_str(&asset["type"]))?;
     s.kv_opt("MIME", as_str(&asset["originalMimeType"]))?;
     if let Some(bytes) = as_u64(&asset["exifInfo"]["fileSizeInByte"]) {
         s.kv("Size", format!("{} ({} bytes)", human_size(bytes), bytes))?;
@@ -184,37 +178,19 @@ fn emit_text<W: std::io::Write>(
     if let (Some(w), Some(h)) = (w, h) {
         s.kv("Dimensions", format!("{w}x{h}"))?;
     }
+    // Duration only renders for video assets.
     if let Some(dur) = as_str(&asset["duration"]) {
         if dur != "0:00:00.00000" && !dur.is_empty() {
             s.kv("Duration", dur)?;
         }
     }
 
-    s.heading("Times")?;
-    // localDateTime is wall-clock time at the place the photo was taken; Immich
-    // ships it as a Z-suffixed string for transport but it's not actually UTC.
-    // Strip the zone suffix so we don't mislabel it.
-    s.kv_opt(
-        "Taken (local)",
-        as_str(&asset["localDateTime"]).map(humanize_naive_iso),
-    )?;
-    s.kv_opt(
-        "Taken (original)",
-        as_str(&asset["exifInfo"]["dateTimeOriginal"]).map(humanize_iso),
-    )?;
-    s.kv_opt("Time zone", as_str(&asset["exifInfo"]["timeZone"]))?;
+    s.heading("Time")?;
+    // Single time, always wall-clock at the photo's location (GPS-derived,
+    // or device EXIF zone if no GPS). Not the current machine's TZ.
     s.kv_opt(
         "File created",
-        as_str(&asset["fileCreatedAt"]).map(humanize_iso),
-    )?;
-    s.kv_opt(
-        "File modified",
-        as_str(&asset["fileModifiedAt"]).map(humanize_iso),
-    )?;
-    s.kv_opt("Indexed at", as_str(&asset["createdAt"]).map(humanize_iso))?;
-    s.kv_opt(
-        "Last updated",
-        as_str(&asset["updatedAt"]).map(humanize_iso),
+        as_str(&asset["localDateTime"]).map(humanize_naive_iso),
     )?;
 
     let has_location =
@@ -344,50 +320,6 @@ fn emit_text<W: std::io::Write>(
         }
     }
 
-    s.heading("Immich")?;
-    s.kv_opt("Asset ID", as_str(&asset["id"]))?;
-    if let Some(owner) = asset["owner"].as_object() {
-        let name = owner.get("name").and_then(Value::as_str).unwrap_or("");
-        let email = owner.get("email").and_then(Value::as_str).unwrap_or("");
-        let label = match (name.is_empty(), email.is_empty()) {
-            (false, false) => format!("{name} <{email}>"),
-            (false, true) => name.to_string(),
-            (true, false) => email.to_string(),
-            (true, true) => String::new(),
-        };
-        if !label.is_empty() {
-            s.kv("Owner", label)?;
-        }
-    }
-    s.kv_opt("Library", as_str(&asset["libraryId"]))?;
-    s.kv_opt("Visibility", as_str(&asset["visibility"]))?;
-    s.kv("Favorite", yes_no(&asset["isFavorite"]))?;
-    s.kv("Archived", yes_no(&asset["isArchived"]))?;
-    s.kv("Trashed", yes_no(&asset["isTrashed"]))?;
-    s.kv("Offline", yes_no(&asset["isOffline"]))?;
-    s.kv("Edited", yes_no(&asset["isEdited"]))?;
-    s.kv("Has metadata", yes_no(&asset["hasMetadata"]))?;
-    s.kv_opt("Checksum", as_str(&asset["checksum"]))?;
-    s.kv_opt("Thumbhash", as_str(&asset["thumbhash"]))?;
-    s.kv_opt(
-        "Description",
-        as_nonempty_str(&asset["exifInfo"]["description"]),
-    )?;
-    s.kv_opt("Rating", as_number(&asset["exifInfo"]["rating"]))?;
-    s.kv_opt("Duplicate of", as_nonempty_str(&asset["duplicateId"]))?;
-    s.kv_opt(
-        "Live photo video",
-        as_nonempty_str(&asset["livePhotoVideoId"]),
-    )?;
-    if let Some(stack) = asset["stack"].as_object() {
-        let primary = stack
-            .get("primaryAssetId")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let count = stack.get("assetCount").and_then(Value::as_u64).unwrap_or(0);
-        s.kv("Stack", format!("primary={primary}, assets={count}"))?;
-    }
-
     Ok(())
 }
 
@@ -420,33 +352,11 @@ fn has_value(v: &Value) -> bool {
     !v.is_null() && as_nonempty_str(v).is_some() || v.is_number()
 }
 
-fn yes_no(v: &Value) -> String {
-    match v.as_bool() {
-        Some(true) => "yes".into(),
-        Some(false) => "no".into(),
-        None => "(unknown)".into(),
-    }
-}
-
-fn humanize_iso(s: String) -> String {
-    // 2025-12-13T09:31:38.134Z → 2025-12-13 09:31:38 UTC
-    // 2025-12-13T17:31:38.134+08:00 → 2025-12-13 17:31:38 +08:00
-    // Falls back to the raw string if parsing fails.
-    chrono::DateTime::parse_from_rfc3339(&s)
-        .map(|dt| {
-            let suffix = if dt.offset().local_minus_utc() == 0 {
-                "UTC".to_string()
-            } else {
-                format!("{}", dt.offset())
-            };
-            format!("{} {}", dt.format("%Y-%m-%d %H:%M:%S"), suffix)
-        })
-        .unwrap_or(s)
-}
-
-/// Same look-and-feel as `humanize_iso`, but for fields like `localDateTime`
-/// where the source value is semantically zone-less (wall-clock at the place
-/// the photo was taken). We deliberately omit the zone marker.
+/// Format Immich's `localDateTime`. The value is wall-clock time at the
+/// photo's location — derived from GPS timezone if available, otherwise
+/// from the camera's EXIF time zone, never from the machine running this
+/// CLI. Immich transports it as a Z-suffixed ISO string but it's not UTC,
+/// so we strip the suffix.
 fn humanize_naive_iso(s: String) -> String {
     chrono::DateTime::parse_from_rfc3339(&s)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -784,20 +694,24 @@ mod tests {
         let out = run_collecting(&cfg(), sample_asset(), OutputFormat::Text);
         for heading in [
             "File",
-            "Times",
+            "Time",
             "Location",
             "Camera",
             "People (2)",
             "Tags (2)",
             "OCR (0 regions)",
             "Albums (0)",
-            "Immich",
         ] {
             assert!(
                 out.contains(heading),
                 "missing heading `{heading}` in:\n{out}"
             );
         }
+        // Bookkeeping `Immich` section was removed as not useful.
+        assert!(
+            !out.contains("\nImmich\n"),
+            "Immich section should be gone:\n{out}"
+        );
     }
 
     fn sample_ocr() -> Value {
@@ -875,20 +789,28 @@ mod tests {
     }
 
     #[test]
-    fn text_output_shows_paths_and_owner() {
+    fn text_output_drops_redundant_path_filename_owner_fields() {
+        // Path/filename are redundant with the input the user just typed,
+        // and owner/library/IDs are bookkeeping — none of these should
+        // appear in the trimmed text output.
         let out = run_collecting(&cfg(), sample_asset(), OutputFormat::Text);
-        assert!(
-            out.contains("/home/u/Photos/PYL/2018/IMG_20180908_185429.jpg"),
-            "missing local path in:\n{out}"
-        );
-        assert!(
-            out.contains("/mnt/qnap/PYL/2018/IMG_20180908_185429.jpg"),
-            "missing server path in:\n{out}"
-        );
-        assert!(
-            out.contains("mingfei <m@x.com>"),
-            "missing owner in:\n{out}"
-        );
+        for unwanted in [
+            "Local path",
+            "Server path",
+            "Filename",
+            "Type:",
+            "Owner",
+            "Asset ID",
+            "Library",
+            "Checksum",
+            "Thumbhash",
+            "Visibility",
+        ] {
+            assert!(
+                !out.contains(unwanted),
+                "unexpected field `{unwanted}` in trimmed output:\n{out}"
+            );
+        }
     }
 
     #[test]
@@ -907,29 +829,26 @@ mod tests {
     }
 
     #[test]
-    fn text_output_humanizes_iso_dates_and_keeps_timezone() {
+    fn time_section_has_single_local_line_no_zone_suffix() {
+        // Only one time is shown — File created — in the photo's local
+        // wall-clock time. Other times (original UTC, file mtime, indexed
+        // at, last updated) are intentionally dropped; they're still
+        // available via --format json.
         let out = run_collecting(&cfg(), sample_asset(), OutputFormat::Text);
-        // Local-time wall clock — must NOT carry a misleading UTC suffix.
-        let local_line = out
+        let time_block: Vec<&str> = out
             .lines()
-            .find(|l| l.contains("Taken (local)"))
-            .expect("missing local-time line");
+            .skip_while(|l| *l != "Time")
+            .skip(1)
+            .take_while(|l| !l.is_empty())
+            .collect();
+        assert_eq!(time_block.len(), 1, "got: {time_block:?}");
+        let line = time_block[0];
+        assert!(line.contains("File created"), "got: {line}");
+        assert!(line.contains("2018-09-08 18:54:29"), "got: {line}");
+        // Wall-clock at photo location, not a UTC moment — no zone label.
         assert!(
-            local_line.contains("2018-09-08 18:54:29"),
-            "got: {local_line}"
-        );
-        assert!(
-            !local_line.contains("UTC"),
-            "local wall-clock time must not be labelled UTC: {local_line}"
-        );
-        // EXIF DateTimeOriginal is a true UTC moment → keeps the UTC marker.
-        let original_line = out
-            .lines()
-            .find(|l| l.contains("Taken (original)"))
-            .expect("missing original-time line");
-        assert!(
-            original_line.contains("2018-09-08 10:54:29 UTC"),
-            "got: {original_line}"
+            !line.contains("UTC") && !line.contains("+"),
+            "local wall-clock must not carry a zone label: {line}"
         );
     }
 
@@ -984,15 +903,21 @@ mod tests {
     }
 
     #[test]
-    fn humanize_iso_keeps_unparseable_input() {
-        assert_eq!(humanize_iso("not-a-date".into()), "not-a-date");
+    fn humanize_naive_strips_zone_marker() {
+        // Inputs Immich ships as Z-suffixed but semantically local must
+        // come out without UTC / offset.
+        assert_eq!(
+            humanize_naive_iso("2018-09-08T18:54:29.000Z".into()),
+            "2018-09-08 18:54:29"
+        );
+        assert_eq!(
+            humanize_naive_iso("2018-09-08T18:54:29+08:00".into()),
+            "2018-09-08 18:54:29"
+        );
     }
 
     #[test]
-    fn humanize_iso_utc_suffix() {
-        assert_eq!(
-            humanize_iso("2018-09-08T10:54:29.000Z".into()),
-            "2018-09-08 10:54:29 UTC"
-        );
+    fn humanize_naive_keeps_unparseable_input() {
+        assert_eq!(humanize_naive_iso("not-a-date".into()), "not-a-date");
     }
 }
