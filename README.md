@@ -168,6 +168,9 @@ immich-cli update-descriptions --taken-after 2024-01-01 --limit 200
 
 # Preview what would change without calling the LLM
 immich-cli update-descriptions --dry-run
+
+# Print the per-asset prompt facts sent to the LLM (omits fixed instructions and image bytes)
+immich-cli update-descriptions --verbose --dry-run
 ```
 
 #### Idempotency

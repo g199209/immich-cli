@@ -85,6 +85,11 @@ pub struct UpdateDescriptionsArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Print the per-asset variable prompt facts sent to the vision LLM.
+    /// Fixed prompt instructions and image bytes are omitted.
+    #[arg(long)]
+    pub verbose: bool,
+
     /// Ignore the "sha and version match → skip" rule. Useful when
     /// re-prompting the same library without bumping CURRENT_VERSION.
     #[arg(long)]
@@ -331,6 +336,12 @@ pub fn build_caption_user_prompt(context: &AssetContext) -> String {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptionPromptParts {
+    variable_facts: String,
+    user_prompt: String,
+}
+
 // ---- single-asset caption pipeline ---------------------------------------
 
 fn cleaned(s: &Option<String>) -> Option<String> {
@@ -417,6 +428,54 @@ fn extract_configured_people(
     people
 }
 
+fn build_caption_prompt_parts<I>(
+    info_be: &I,
+    asset: &Asset,
+    people_map: &BTreeMap<String, Vec<String>>,
+    admin2_lookup: &Admin2Lookup,
+) -> Result<CaptionPromptParts>
+where
+    I: InfoBackend,
+{
+    let full_asset = if people_map.is_empty() {
+        None
+    } else {
+        Some(
+            info_be
+                .get_asset(&asset.id)
+                .with_context(|| format!("failed to fetch full asset detail for {}", asset.id))?,
+        )
+    };
+    let context = build_asset_context(asset, full_asset.as_ref(), people_map, admin2_lookup);
+    let variable_facts = context.prompt_facts();
+    let user_prompt = build_caption_user_prompt(&context);
+    Ok(CaptionPromptParts {
+        variable_facts,
+        user_prompt,
+    })
+}
+
+fn caption_with_prompt_parts<C, V>(
+    client: &C,
+    llm: &V,
+    asset: &Asset,
+    prompt: &CaptionPromptParts,
+) -> Result<String>
+where
+    C: CaptionBackend,
+    V: CaptionLlm,
+{
+    let bytes = client.thumbnail(&asset.id)?;
+    let body = llm.caption(
+        CAPTION_SYSTEM_PROMPT,
+        &prompt.user_prompt,
+        &bytes,
+        "image/jpeg",
+        MAX_COMPLETION_TOKENS,
+    )?;
+    Ok(assemble_with_footer(body.trim(), &asset.checksum))
+}
+
 /// Produce a fresh description for one asset by fetching its full asset
 /// detail (for configured people), fetching its thumbnail, and asking the
 /// vision model. The footer is appended here.
@@ -431,26 +490,8 @@ where
     C: CaptionBackend + InfoBackend,
     V: CaptionLlm,
 {
-    let full_asset = if people_map.is_empty() {
-        None
-    } else {
-        Some(
-            client
-                .get_asset(&asset.id)
-                .with_context(|| format!("failed to fetch full asset detail for {}", asset.id))?,
-        )
-    };
-    let context = build_asset_context(asset, full_asset.as_ref(), people_map, admin2_lookup);
-    let user_prompt = build_caption_user_prompt(&context);
-    let bytes = client.thumbnail(&asset.id)?;
-    let body = llm.caption(
-        CAPTION_SYSTEM_PROMPT,
-        &user_prompt,
-        &bytes,
-        "image/jpeg",
-        MAX_COMPLETION_TOKENS,
-    )?;
-    Ok(assemble_with_footer(body.trim(), &asset.checksum))
+    let prompt = build_caption_prompt_parts(client, asset, people_map, admin2_lookup)?;
+    caption_with_prompt_parts(client, llm, asset, &prompt)
 }
 
 // ---- candidate enumeration -----------------------------------------------
@@ -674,6 +715,18 @@ where
                     r, asset.id, asset.original_path
                 )
                 .ok();
+                if args.verbose {
+                    match build_caption_prompt_parts(caption_be, asset, &cfg.people, admin2_lookup)
+                    {
+                        Ok(prompt) => write_verbose_prompt_facts(log, asset, *r, &prompt).ok(),
+                        Err(e) => writeln!(
+                            log,
+                            "DRY-RUN prompt unavailable: {} {} — {e:#}",
+                            asset.id, asset.original_path
+                        )
+                        .ok(),
+                    };
+                }
             }
         }
         return Ok(());
@@ -690,7 +743,31 @@ where
         &cfg.people,
         admin2_lookup,
         args.parallel as usize,
+        args.verbose,
         log,
+    )
+}
+
+fn write_verbose_prompt_facts<W: std::io::Write>(
+    log: &mut W,
+    asset: &Asset,
+    reason: CaptionReason,
+    prompt: &CaptionPromptParts,
+) -> std::io::Result<()> {
+    writeln!(
+        log,
+        "[verbose] update-descriptions: prompt facts ({:?}): {} {}",
+        reason, asset.id, asset.original_path
+    )?;
+    writeln!(
+        log,
+        "[verbose] update-descriptions: ---- variable prompt begin ----"
+    )?;
+    writeln!(log, "已知客观事实：")?;
+    writeln!(log, "{}", prompt.variable_facts)?;
+    writeln!(
+        log,
+        "[verbose] update-descriptions: ---- variable prompt end ----"
     )
 }
 
@@ -703,6 +780,7 @@ fn process_in_parallel<C, V, W>(
     people_map: &BTreeMap<String, Vec<String>>,
     admin2_lookup: &Admin2Lookup,
     parallel: usize,
+    verbose: bool,
     log: &mut W,
 ) -> Result<()>
 where
@@ -727,7 +805,14 @@ where
                     Decision::Caption(r) => *r,
                     Decision::Skip(_) => unreachable!("filtered above"),
                 };
-                let res = caption_one(caption_be, llm, asset, people_map, admin2_lookup)
+                let res = build_caption_prompt_parts(caption_be, asset, people_map, admin2_lookup)
+                    .and_then(|prompt| {
+                        if verbose {
+                            let mut log = log_lock.lock().unwrap();
+                            write_verbose_prompt_facts(&mut *log, asset, reason, &prompt).ok();
+                        }
+                        caption_with_prompt_parts(caption_be, llm, asset, &prompt)
+                    })
                     .and_then(|new_desc| caption_be.update_description(&asset.id, &new_desc));
                 let mut log = log_lock.lock().unwrap();
                 match res {
@@ -1050,6 +1135,7 @@ mod tests {
             limit: 0,
             parallel: 2,
             dry_run: false,
+            verbose: false,
             force: false,
         }
     }
@@ -1164,6 +1250,40 @@ mod tests {
         assert!(caption.updates.lock().unwrap().is_empty());
         let log_s = String::from_utf8(log).unwrap();
         assert!(log_s.contains("DRY-RUN"));
+    }
+
+    #[test]
+    fn run_with_verbose_logs_only_variable_prompt_facts() {
+        let mut asset = asset_with("a", "/mnt/qnap/a.jpg", "cs-a-xxxxx", None);
+        asset.local_date_time = Some("2024-03-12T17:08:42.000".into());
+        let search = FakeSearch::new(vec![bucket(vec![asset])]);
+        let caption = FakeCaption::new();
+        caption
+            .thumbnails
+            .lock()
+            .unwrap()
+            .insert("a".into(), b"aW1hZ2UtYnl0ZXM=".to_vec());
+        let vision = FakeVision {
+            reply: "新描述".into(),
+        };
+        let mut a = args();
+        a.parallel = 1;
+        a.verbose = true;
+        let mut log = Vec::new();
+        run_with(&cfg(), &search, &caption, &vision, a, &mut log).unwrap();
+
+        let log_s = String::from_utf8(log).unwrap();
+        assert!(
+            log_s.contains("[verbose] update-descriptions: ---- variable prompt begin ----"),
+            "{log_s}"
+        );
+        assert!(log_s.contains("已知客观事实："), "{log_s}");
+        assert!(
+            log_s.contains("拍摄时间: 2024-03-12T17:08:42.000"),
+            "{log_s}"
+        );
+        assert!(!log_s.contains("请尽可能详尽地分析这张图片"), "{log_s}");
+        assert!(!log_s.contains("aW1hZ2UtYnl0ZXM="), "{log_s}");
     }
 
     #[test]

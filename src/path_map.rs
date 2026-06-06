@@ -64,7 +64,10 @@ mod tests {
     fn simple_translation() {
         let m = vec![entry("/mnt/qnap-photos", "/home/u/QNAP-Photos")];
         let got = translate("/mnt/qnap-photos/Family/2025/img.jpg", &m).unwrap();
-        assert_eq!(got, PathBuf::from("/home/u/QNAP-Photos/Family/2025/img.jpg"));
+        assert_eq!(
+            got,
+            PathBuf::from("/home/u/QNAP-Photos/Family/2025/img.jpg")
+        );
     }
 
     #[test]
