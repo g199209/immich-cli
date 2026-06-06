@@ -1,5 +1,6 @@
 use crate::config::LlmConfig;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -9,6 +10,23 @@ pub trait ChatBackend {
     /// Send the messages, force JSON output, return the assistant message
     /// content (still a string — caller parses the JSON).
     fn chat_json(&self, messages: &[Message]) -> Result<String>;
+}
+
+/// Vision captioning backend used by `update-descriptions`. Single-shot:
+/// system + user text + one inline image, returns free-form text.
+pub trait CaptionLlm {
+    /// `image_bytes` is the raw JPEG (or PNG/WebP) the model sees.
+    /// `mime` is something like `"image/jpeg"`. Caller bounds the size.
+    /// `system_prompt` and `user_prompt` are sent as text; `max_tokens`
+    /// is the upper bound on completion (large for reasoning models).
+    fn caption(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        image_bytes: &[u8],
+        mime: &str,
+        max_tokens: u32,
+    ) -> Result<String>;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -37,7 +55,11 @@ impl Message {
 pub struct OpenAiClient {
     base_url: String,
     api_key: String,
+    /// Text-only model. Used by [`ChatBackend::chat_json`].
     model: String,
+    /// Optional vision model. Used by [`CaptionLlm::caption`]. Calling
+    /// `caption` without configuring this errors at runtime.
+    vision_model: Option<String>,
     http: reqwest::blocking::Client,
 }
 
@@ -51,6 +73,7 @@ impl OpenAiClient {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
+            vision_model: cfg.vision_model.clone(),
             http,
         })
     }
@@ -70,6 +93,27 @@ struct ResponseFormat {
     kind: &'static str,
 }
 
+// Multimodal request: messages are a mix of text and image blocks. The
+// model field is the vision model. No response_format here — we want
+// free-form text, not JSON.
+#[derive(Serialize)]
+struct VisionRequest<'a> {
+    model: &'a str,
+    messages: Vec<VisionMessage<'a>>,
+    temperature: f32,
+    max_tokens: u32,
+}
+
+#[derive(Serialize)]
+struct VisionMessage<'a> {
+    role: &'static str,
+    /// Either a plain string (for system) or an array of typed parts (for
+    /// user). serde_json::Value covers both shapes.
+    content: serde_json::Value,
+    #[serde(skip)]
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -82,7 +126,11 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct ChoiceMessage {
-    content: String,
+    /// May be null for reasoning models that ran out of tokens before
+    /// producing visible output (mimo-v2.5, o1-style). We surface that
+    /// as a clear error rather than letting the deserializer fail.
+    #[serde(default)]
+    content: Option<String>,
 }
 
 impl ChatBackend for OpenAiClient {
@@ -103,23 +151,81 @@ impl ChatBackend for OpenAiClient {
             .json(&body)
             .send()
             .with_context(|| format!("HTTP POST {url} failed"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
-            bail!("LLM returned {status}: {body}");
-        }
-        let parsed: ChatResponse = resp
-            .json()
-            .with_context(|| format!("failed to decode LLM response from {url}"))?;
-        let content = parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("LLM returned no choices"))?;
-        if content.trim().is_empty() {
-            bail!("LLM returned empty content");
-        }
-        Ok(content)
+        unpack_chat_content(resp, &url)
     }
+}
+
+impl CaptionLlm for OpenAiClient {
+    fn caption(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        image_bytes: &[u8],
+        mime: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
+        let model = self
+            .vision_model
+            .as_deref()
+            .ok_or_else(|| anyhow!("config.llm.vision_model is not set"))?;
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let data_url = format!("data:{mime};base64,{}", B64.encode(image_bytes));
+
+        let body = VisionRequest {
+            model,
+            temperature: 0.0,
+            max_tokens,
+            messages: vec![
+                VisionMessage {
+                    role: "system",
+                    content: serde_json::Value::String(system_prompt.to_string()),
+                    _phantom: std::marker::PhantomData,
+                },
+                VisionMessage {
+                    role: "user",
+                    content: serde_json::json!([
+                        { "type": "text", "text": user_prompt },
+                        { "type": "image_url", "image_url": { "url": data_url } },
+                    ]),
+                    _phantom: std::marker::PhantomData,
+                },
+            ],
+        };
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .with_context(|| format!("HTTP POST {url} (vision) failed"))?;
+        unpack_chat_content(resp, &url)
+    }
+}
+
+fn unpack_chat_content(resp: reqwest::blocking::Response, url: &str) -> Result<String> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        bail!("LLM returned {status}: {body}");
+    }
+    let parsed: ChatResponse = resp
+        .json()
+        .with_context(|| format!("failed to decode LLM response from {url}"))?;
+    let content = parsed
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("LLM returned no choices"))?
+        .message
+        .content
+        .ok_or_else(|| {
+            anyhow!(
+                "LLM returned null content — reasoning model likely \
+                 hit max_tokens before emitting output; try raising it"
+            )
+        })?;
+    if content.trim().is_empty() {
+        bail!("LLM returned empty content");
+    }
+    Ok(content)
 }

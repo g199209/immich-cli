@@ -458,6 +458,7 @@ mod tests {
             asset_type: asset_type.into(),
             file_created_at: Some(taken.into()),
             local_date_time: Some(taken.into()),
+            checksum: String::new(),
             exif_info: Some(ExifInfo {
                 city: Some("Shanghai".into()),
                 state: Some("Shanghai".into()),

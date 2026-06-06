@@ -83,6 +83,11 @@ pub struct Asset {
     pub asset_type: String,
     pub file_created_at: Option<String>,
     pub local_date_time: Option<String>,
+    /// Base64-encoded checksum (SHA-1) of the file. Used by
+    /// `update-descriptions` to detect when the underlying file has
+    /// changed so previously-generated captions can be refreshed.
+    #[serde(default)]
+    pub checksum: String,
     #[serde(default)]
     pub exif_info: Option<ExifInfo>,
 }

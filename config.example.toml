@@ -12,11 +12,12 @@ local  = "~/QNAP-Photos"
 # Optional: HTTP request timeout in seconds. Defaults to 60.
 # timeout_secs = 60
 
-# Optional: LLM endpoint used by the `ask` subcommand.
-# Any OpenAI-compatible /v1/chat/completions gateway works
+# Optional: LLM endpoint used by `ask` (text) and `update-descriptions`
+# (vision). Any OpenAI-compatible /v1/chat/completions gateway works
 # (OneAPI, LiteLLM, Ollama's OpenAI shim, OpenAI itself, ...).
 # [llm]
-# base_url = "http://10.42.1.26:3000"
-# api_key  = "sk-..."
-# model    = "deepseek-v4-flash"
+# base_url     = "http://10.42.1.26:3000"
+# api_key      = "sk-..."
+# model        = "deepseek-v4-flash"   # text model, for `ask`
+# vision_model = "mimo-v2.5"           # vision model, for `update-descriptions`
 # timeout_secs = 120

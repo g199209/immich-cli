@@ -9,6 +9,21 @@ pub trait SearchBackend {
     fn search(&self, req: &SearchRequest) -> Result<SearchResponse>;
 }
 
+/// Backend the `update-descriptions` subcommand talks to. Two operations:
+/// pull the Immich-rendered preview thumbnail for an asset (cheap JPEG,
+/// already orientation-corrected, no HEIC/RAW handling on our side) and
+/// PUT a new description back.
+pub trait CaptionBackend {
+    /// `GET /api/assets/{id}/thumbnail?size=thumbnail` — returns a small
+    /// JPEG (~720x960) ready to send to a vision model.
+    fn thumbnail(&self, id: &str) -> Result<Vec<u8>>;
+
+    /// `PUT /api/assets/{id}` with `{"description": ...}`. Requires the
+    /// API token to have the `asset.update` permission scope; without it
+    /// the server returns 403.
+    fn update_description(&self, id: &str, description: &str) -> Result<()>;
+}
+
 /// Backend the `info` subcommand talks to. Separate from `SearchBackend`
 /// because info needs raw asset+album JSON and would otherwise force every
 /// fake search backend in the suite to implement these too.
@@ -142,6 +157,43 @@ impl ImmichClient {
             .send()
             .with_context(|| format!("HTTP GET {url} failed"))?;
         unpack_json(resp, &url)
+    }
+}
+
+impl CaptionBackend for ImmichClient {
+    fn thumbnail(&self, id: &str) -> Result<Vec<u8>> {
+        let url = format!("{}/api/assets/{id}/thumbnail", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("size", "thumbnail")])
+            .send()
+            .with_context(|| format!("HTTP GET {url}?size=thumbnail failed"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            bail!("Immich returned {status} for {url}: {body}");
+        }
+        resp.bytes()
+            .map(|b| b.to_vec())
+            .with_context(|| format!("failed to read thumbnail bytes from {url}"))
+    }
+
+    fn update_description(&self, id: &str, description: &str) -> Result<()> {
+        let url = format!("{}/api/assets/{id}", self.base_url);
+        let body = serde_json::json!({ "description": description });
+        let resp = self
+            .http
+            .put(&url)
+            .json(&body)
+            .send()
+            .with_context(|| format!("HTTP PUT {url} failed"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            bail!("Immich returned {status} for PUT {url}: {body}");
+        }
+        Ok(())
     }
 }
 

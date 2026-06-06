@@ -483,6 +483,7 @@ mod tests {
             asset_type: "IMAGE".into(),
             file_created_at: Some("2024-03-05T02:42:05Z".into()),
             local_date_time: Some("2024-03-05T10:42:05Z".into()),
+            checksum: String::new(),
             exif_info: Some(ExifInfo {
                 city: Some("Kangqiao".into()),
                 state: Some("Shanghai".into()),

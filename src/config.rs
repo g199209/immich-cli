@@ -26,9 +26,16 @@ pub struct Config {
 pub struct LlmConfig {
     pub base_url: String,
     pub api_key: String,
+    /// Text-only model used by the `ask` subcommand for keyword
+    /// expansion and rerank.
     pub model: String,
-    /// Per-call request timeout. Reranking long descriptions takes time;
-    /// default is generous on purpose.
+    /// Vision-capable model used by `update-descriptions` for captioning.
+    /// Optional: only required when running that subcommand.
+    #[serde(default)]
+    pub vision_model: Option<String>,
+    /// Per-call request timeout. Reranking long descriptions and
+    /// generating captions both take time; default is generous on
+    /// purpose.
     #[serde(default = "default_llm_timeout")]
     pub timeout_secs: u64,
 }
@@ -83,6 +90,11 @@ impl Config {
             }
             if llm.model.is_empty() {
                 bail!("config.llm.model is empty");
+            }
+            if let Some(vm) = llm.vision_model.as_ref() {
+                if vm.is_empty() {
+                    bail!("config.llm.vision_model is empty (omit the field if you don't want to set it)");
+                }
             }
         }
 

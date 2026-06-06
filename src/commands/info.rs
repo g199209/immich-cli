@@ -563,6 +563,7 @@ mod tests {
                     asset_type: "IMAGE".into(),
                     file_created_at: None,
                     local_date_time: None,
+                    checksum: String::new(),
                     exif_info: None,
                 }],
                 next_page: None,
@@ -584,6 +585,7 @@ mod tests {
                 asset_type: "IMAGE".into(),
                 file_created_at: None,
                 local_date_time: None,
+                checksum: String::new(),
                 exif_info: None,
             })
             .collect::<Vec<_>>();
