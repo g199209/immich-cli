@@ -137,7 +137,8 @@ is unavailable.
 `ask` only matches against the `exifInfo.description` field. If your
 assets have no descriptions yet, every query will report "no description
 matched any keyword" — populate descriptions via your own pipeline first
-(e.g., a vision-language-model captioning step writing back to the file
-EXIF or sidecar). Immich's external libraries are read-only via the API
-(PUT to `/api/assets/{id}` returns 403 for description), so descriptions
-have to be written to disk and re-indexed.
+(e.g., a vision-language-model captioning step). The simplest write
+path is `PUT /api/assets/{id}` with body `{"description": "..."}`; this
+works on external NFS libraries too. The only requirement is that the
+API token has the `asset.update` permission — create one in Immich's
+Web UI → User Settings → API Keys if your current key lacks it.
