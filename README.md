@@ -39,8 +39,16 @@ local  = "~/QNAP-Photos"
 values — is rejected to avoid accidentally listing the entire library.
 
 ```bash
-# Smart (CLIP) query
-immich-cli search -q "child playing" --limit 20
+# Natural-language query. With [llm] configured, this fires off BOTH
+# Immich's CLIP smart search AND an LLM-mediated semantic search over
+# photo descriptions; the two ranked lists are merged with Reciprocal
+# Rank Fusion (RRF). Without [llm], it gracefully degrades to CLIP only.
+immich-cli search -q "孩子戴生日帽" --limit 20
+
+# Skip the CLIP path entirely; description-only semantic search.
+# Useful once your descriptions are comprehensive enough to subsume
+# what CLIP would have surfaced. Requires [llm].
+immich-cli search -q "穿带兔子图案毛衣的小孩" --description-only
 
 # Time window only (YYYY-MM-DD or full ISO 8601)
 immich-cli search --taken-after 2025-01-01 --taken-before 2025-12-31
@@ -108,40 +116,6 @@ The JSON format is the full `/api/assets/{id}` body plus three
 top-level fields we add: `localPath` (resolved NFS path), `albums`
 (membership list), and `ocr` (text regions). Nothing is dropped, so
 it's safe to query for anything Immich exposes.
-
-### `ask`
-
-`ask` does **natural-language semantic search over photo descriptions**,
-mediated by an LLM. The CLI itself stays stateless — there is no local
-vector store. Each query runs three stages:
-
-1. **Keyword expansion**: the LLM extracts up to 16 substring keywords
-   (including synonyms and lexical variants) from the natural-language
-   query.
-2. **Substring search**: each keyword is fanned out against Immich's
-   metadata `description` filter; the union (deduped by asset id) forms
-   the candidate set (capped at 100).
-3. **Rerank**: the LLM is shown the query and candidate descriptions and
-   returns the relevant ids in order.
-
-```bash
-# Add an [llm] section to config.toml first (see config.example.toml).
-immich-cli ask "我想看看非洲草原上的一大群大象聚集在一起的照片"
-immich-cli ask "sunset over the ocean with sailing boats" --format table
-```
-
-Requires the `[llm]` section in `config.toml`. Without it `ask` errors
-out — there is intentionally no fallback so the user knows the feature
-is unavailable.
-
-`ask` only matches against the `exifInfo.description` field. If your
-assets have no descriptions yet, every query will report "no description
-matched any keyword" — populate descriptions via your own pipeline first
-(e.g., a vision-language-model captioning step). The simplest write
-path is `PUT /api/assets/{id}` with body `{"description": "..."}`; this
-works on external NFS libraries too. The only requirement is that the
-API token has the `asset.update` permission — create one in Immich's
-Web UI → User Settings → API Keys if your current key lacks it.
 
 ### `update-descriptions`
 

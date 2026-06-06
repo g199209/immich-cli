@@ -1,5 +1,7 @@
 use crate::client::{ImmichClient, SearchBackend};
 use crate::config::{Config, PathMapEntry};
+use crate::description_search::{self, HardFilters};
+use crate::llm::{ChatBackend, OpenAiClient};
 use crate::models::{Asset, SearchRequest};
 use crate::path_map;
 use anyhow::{bail, Context, Result};
@@ -8,9 +10,22 @@ use std::path::PathBuf;
 
 #[derive(Args, Debug)]
 pub struct SearchArgs {
-    /// Smart-search query (CLIP). When set, the smart-search endpoint is used.
+    /// Natural-language query. By default it drives two parallel ranked
+    /// searches that are merged with Reciprocal Rank Fusion: (1) Immich
+    /// smart search (CLIP image-similarity), and (2) LLM-mediated
+    /// description search (keyword expansion + substring match against
+    /// `exifInfo.description` + LLM rerank).
+    ///
+    /// With `--description-only`, the CLIP path is skipped. If no
+    /// `[llm]` block is configured, the description path is skipped.
     #[arg(short, long)]
     pub query: Option<String>,
+
+    /// Skip the CLIP path; only run the LLM-mediated description search.
+    /// Requires `[llm]` in config; errors otherwise. Has no effect when
+    /// `--query` is unset.
+    #[arg(long, default_value_t = false)]
+    pub description_only: bool,
 
     /// Earliest `localDateTime` to include. ISO 8601, or YYYY-MM-DD (UTC start of day).
     #[arg(long, value_name = "DATE")]
@@ -150,13 +165,98 @@ fn cleaned(opt: &Option<String>) -> Option<String> {
 
 pub fn run(cfg: &Config, args: SearchArgs) -> Result<()> {
     args.validate()?;
-
     let client = ImmichClient::new(cfg)?;
-    let result = fetch_assets(&client, &args)?;
-
+    let llm = cfg.llm.as_ref().map(OpenAiClient::new).transpose()?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    emit_to_writer(&cfg.path_map, &args, &result, &mut out)
+    run_with(cfg, &client, llm.as_ref(), &args, &mut out)
+}
+
+/// Test/library entry. Decouples the runtime from concrete clients so
+/// we can swap in fakes.
+pub fn run_with<S, L, W>(
+    cfg: &Config,
+    search_be: &S,
+    llm: Option<&L>,
+    args: &SearchArgs,
+    out: &mut W,
+) -> Result<()>
+where
+    S: SearchBackend,
+    L: ChatBackend,
+    W: std::io::Write,
+{
+    let result = perform_search(search_be, llm, args)?;
+    emit_to_writer(&cfg.path_map, args, &result, out)
+}
+
+/// Decide which path(s) to run based on flags + config presence, then
+/// merge if both ran.
+fn perform_search<S, L>(search_be: &S, llm: Option<&L>, args: &SearchArgs) -> Result<FetchResult>
+where
+    S: SearchBackend,
+    L: ChatBackend,
+{
+    let query = cleaned(&args.query);
+
+    // No -q at all: filter-only, no LLM in play.
+    let Some(q) = query.as_deref() else {
+        return fetch_assets(search_be, args);
+    };
+
+    // -q is set. Description-only means LLM is mandatory.
+    if args.description_only {
+        let llm = llm.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--description-only requires an [llm] section in config.toml \
+                 (base_url, api_key, model)"
+            )
+        })?;
+        let filters = build_hard_filters(args)?;
+        let assets = description_search::run(search_be, llm, q, &filters)?;
+        return Ok(FetchResult {
+            assets,
+            truncated: false,
+        });
+    }
+
+    // -q is set, both paths allowed. Run CLIP. If LLM is configured,
+    // also run description and merge.
+    let clip = fetch_assets(search_be, args)?;
+    let Some(llm) = llm else {
+        return Ok(clip);
+    };
+    let filters = build_hard_filters(args)?;
+    let description = description_search::run(search_be, llm, q, &filters)?;
+    if description.is_empty() {
+        return Ok(clip);
+    }
+    let merged = description_search::rrf_merge(&[clip.assets, description]);
+    let limit = args.limit as usize;
+    let truncated = merged.len() > limit;
+    let assets = merged.into_iter().take(limit).collect();
+    Ok(FetchResult { assets, truncated })
+}
+
+/// Build the hard-filter bundle the description path needs. Reuses
+/// `cleaned` + date normalization from this module so both paths see
+/// the exact same values.
+fn build_hard_filters(args: &SearchArgs) -> Result<HardFilters> {
+    Ok(HardFilters {
+        city: cleaned(&args.city),
+        state: cleaned(&args.state),
+        country: cleaned(&args.country),
+        ocr: cleaned(&args.ocr),
+        taken_after: cleaned(&args.taken_after)
+            .as_deref()
+            .map(normalize_date_start)
+            .transpose()?,
+        taken_before: cleaned(&args.taken_before)
+            .as_deref()
+            .map(normalize_date_end)
+            .transpose()?,
+        asset_type: args.r#type.map(|t| t.as_api_str().to_string()),
+    })
 }
 
 /// Outcome of a paginated fetch: the items we kept, plus whether the
@@ -473,6 +573,7 @@ mod tests {
     fn default_args() -> SearchArgs {
         SearchArgs {
             query: None,
+            description_only: false,
             taken_after: None,
             taken_before: None,
             city: None,
@@ -1007,5 +1108,166 @@ mod tests {
         assert_eq!(lines.len(), 2);
         let marker: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(marker["truncated"], true);
+    }
+
+    // ---- perform_search: CLIP + description merge logic ------------------
+
+    struct FakeLlm {
+        replies: RefCell<Vec<String>>,
+    }
+    impl FakeLlm {
+        fn new(replies: &[&str]) -> Self {
+            Self {
+                replies: RefCell::new(replies.iter().map(|s| s.to_string()).collect()),
+            }
+        }
+    }
+    impl crate::llm::ChatBackend for FakeLlm {
+        fn chat_json(&self, _messages: &[crate::llm::Message]) -> Result<String> {
+            Ok(self.replies.borrow_mut().remove(0))
+        }
+    }
+
+    fn asset_with_desc(id: &str, path: &str, desc: &str) -> Asset {
+        let mut a = make_asset(id, path, "IMAGE", "2025-01-01T00:00:00Z");
+        if let Some(e) = a.exif_info.as_mut() {
+            e.description = Some(desc.into());
+        }
+        a
+    }
+
+    #[test]
+    fn perform_search_without_query_does_filter_only_no_llm() {
+        let backend = FakeBackend::new(vec![resp(
+            vec![asset_with_desc("a", "/mnt/x/a.jpg", "desc-a")],
+            None,
+        )]);
+        let mut args = default_args();
+        args.country = Some("China".into());
+        // LLM provided but should NOT be used (no -q).
+        let llm = FakeLlm::new(&[]);
+        let got = perform_search(&backend, Some(&llm), &args).unwrap();
+        assert_eq!(got.assets.len(), 1);
+        // Only the CLIP/metadata path call, never the description workflow.
+        assert_eq!(backend.calls().len(), 1);
+    }
+
+    #[test]
+    fn perform_search_with_query_no_llm_runs_clip_only() {
+        let backend = FakeBackend::new(vec![resp(
+            vec![asset_with_desc("a", "/mnt/x/a.jpg", "desc-a")],
+            None,
+        )]);
+        let mut args = default_args();
+        args.query = Some("elephants".into());
+        let got = perform_search::<_, FakeLlm>(&backend, None, &args).unwrap();
+        assert_eq!(got.assets.len(), 1);
+        assert_eq!(backend.calls().len(), 1);
+        // The single call was to /smart (query is set).
+        assert_eq!(backend.calls()[0].query.as_deref(), Some("elephants"));
+    }
+
+    #[test]
+    fn perform_search_description_only_requires_llm() {
+        let backend = FakeBackend::new(vec![]);
+        let mut args = default_args();
+        args.query = Some("elephants".into());
+        args.description_only = true;
+        let err = perform_search::<_, FakeLlm>(&backend, None, &args)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[llm]"), "got: {err}");
+    }
+
+    #[test]
+    fn perform_search_description_only_skips_clip_path() {
+        let backend = FakeBackend::new(vec![
+            // Only the per-keyword metadata search; no CLIP call.
+            resp(vec![asset_with_desc("a", "/mnt/x/a.jpg", "desc-a")], None),
+        ]);
+        let mut args = default_args();
+        args.query = Some("elephants".into());
+        args.description_only = true;
+        let llm = FakeLlm::new(&[r#"{"keywords":["大象"]}"#, r#"{"ids":["a"]}"#]);
+        let got = perform_search(&backend, Some(&llm), &args).unwrap();
+        assert_eq!(got.assets.len(), 1);
+        assert_eq!(got.assets[0].id, "a");
+        // Exactly 1 search call: per-keyword. No CLIP call.
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].description.as_deref(), Some("大象"));
+        assert!(calls[0].query.is_none(), "CLIP query must not be sent");
+    }
+
+    #[test]
+    fn perform_search_combined_merges_clip_and_description_with_rrf() {
+        // CLIP returns: [a, b] (in that rank order)
+        // Description workflow returns: [c, b]   (LLM-reranked)
+        // RRF should put `b` first (appears in both), then `a`, then `c`.
+        let backend = FakeBackend::new(vec![
+            // First call: CLIP smart search (query is set)
+            resp(
+                vec![
+                    asset_with_desc("a", "/mnt/x/a.jpg", "x"),
+                    asset_with_desc("b", "/mnt/x/b.jpg", "x"),
+                ],
+                None,
+            ),
+            // Then one metadata call per keyword (just one keyword here)
+            resp(
+                vec![
+                    asset_with_desc("c", "/mnt/x/c.jpg", "desc-c"),
+                    asset_with_desc("b", "/mnt/x/b.jpg", "desc-b"),
+                ],
+                None,
+            ),
+        ]);
+        let mut args = default_args();
+        args.query = Some("elephants".into());
+        let llm = FakeLlm::new(&[r#"{"keywords":["大象"]}"#, r#"{"ids":["c","b"]}"#]);
+        let got = perform_search(&backend, Some(&llm), &args).unwrap();
+        let ids: Vec<&str> = got.assets.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn perform_search_hard_filters_apply_to_both_paths() {
+        let backend = FakeBackend::new(vec![
+            resp(vec![asset_with_desc("a", "/mnt/x/a.jpg", "x")], None),
+            resp(vec![asset_with_desc("b", "/mnt/x/b.jpg", "desc")], None),
+        ]);
+        let mut args = default_args();
+        args.query = Some("x".into());
+        args.country = Some("China".into());
+        let llm = FakeLlm::new(&[r#"{"keywords":["猫"]}"#, r#"{"ids":["b"]}"#]);
+        perform_search(&backend, Some(&llm), &args).unwrap();
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2);
+        for c in &calls {
+            assert_eq!(
+                c.country.as_deref(),
+                Some("China"),
+                "every backend call must carry the country filter; got {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn perform_search_combined_falls_back_to_clip_when_description_empty() {
+        let backend = FakeBackend::new(vec![
+            // CLIP returns 1 hit
+            resp(vec![asset_with_desc("a", "/mnt/x/a.jpg", "x")], None),
+            // Description workflow's substring search hits nothing
+            resp(vec![], None),
+        ]);
+        let mut args = default_args();
+        args.query = Some("elephants".into());
+        let llm = FakeLlm::new(&[
+            r#"{"keywords":["大象"]}"#,
+            // rerank never called because candidates is empty
+        ]);
+        let got = perform_search(&backend, Some(&llm), &args).unwrap();
+        assert_eq!(got.assets.len(), 1);
+        assert_eq!(got.assets[0].id, "a");
     }
 }

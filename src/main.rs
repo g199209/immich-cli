@@ -24,8 +24,6 @@ enum Command {
     Search(commands::search::SearchArgs),
     /// Show all available metadata for a single photo, given its local NFS path
     Info(commands::info::InfoArgs),
-    /// Find photos by natural-language description, via LLM keyword expansion + rerank
-    Ask(commands::ask::AskArgs),
     /// Generate (or refresh) photo descriptions via a vision LLM, idempotently
     UpdateDescriptions(commands::update_descriptions::UpdateDescriptionsArgs),
 }
@@ -37,7 +35,6 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Search(args) => commands::search::run(&cfg, args),
         Command::Info(args) => commands::info::run(&cfg, args),
-        Command::Ask(args) => commands::ask::run(&cfg, args),
         Command::UpdateDescriptions(args) => commands::update_descriptions::run(&cfg, args),
     }
 }
