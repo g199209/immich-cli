@@ -34,9 +34,9 @@ local  = "~/QNAP-Photos"
 ### `search`
 
 `search` requires at least one filter (`--query`, `--taken-after`,
-`--taken-before`, `--city`, `--state`, `--country`, or `--type`); running
-it bare — or with only empty/whitespace flag values — is rejected to
-avoid accidentally listing the entire library.
+`--taken-before`, `--city`, `--state`, `--country`, `--ocr`, or
+`--type`); running it bare — or with only empty/whitespace flag
+values — is rejected to avoid accidentally listing the entire library.
 
 ```bash
 # Smart (CLIP) query
@@ -47,6 +47,10 @@ immich-cli search --taken-after 2025-01-01 --taken-before 2025-12-31
 
 # Geo location (EXIF city / state / country, exact match)
 immich-cli search --country "People's Republic of China" --city Kangqiao
+
+# Substring match against OCR-detected text in the image (Unicode-aware)
+immich-cli search --ocr "DELL"
+immich-cli search --ocr "老年"
 
 # Combine everything, restrict to videos, print a table
 immich-cli search -q person --city Kangqiao \

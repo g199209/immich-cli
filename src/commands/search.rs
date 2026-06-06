@@ -32,6 +32,12 @@ pub struct SearchArgs {
     #[arg(long)]
     pub country: Option<String>,
 
+    /// Substring match against text Immich's OCR detected in the image.
+    /// Case-sensitive, Unicode-aware. Combines with --query and the
+    /// other filters.
+    #[arg(long)]
+    pub ocr: Option<String>,
+
     /// Restrict by asset type.
     #[arg(long, value_enum)]
     pub r#type: Option<AssetTypeArg>,
@@ -105,6 +111,7 @@ impl SearchArgs {
             || non_blank(&self.city)
             || non_blank(&self.state)
             || non_blank(&self.country)
+            || non_blank(&self.ocr)
             || self.r#type.is_some()
     }
 
@@ -115,7 +122,7 @@ impl SearchArgs {
         if !self.has_filter() {
             bail!(
                 "search requires at least one filter: --query, --taken-after, \
-                 --taken-before, --city, --state, --country, or --type"
+                 --taken-before, --city, --state, --country, --ocr, or --type"
             );
         }
         Ok(())
@@ -186,6 +193,7 @@ fn fetch_assets_inner<B: SearchBackend>(
     let city = cleaned(&args.city);
     let state = cleaned(&args.state);
     let country = cleaned(&args.country);
+    let ocr = cleaned(&args.ocr);
 
     let mut collected: Vec<Asset> = Vec::with_capacity(args.limit as usize);
     let mut page: u32 = 1;
@@ -198,6 +206,7 @@ fn fetch_assets_inner<B: SearchBackend>(
             city: city.clone(),
             state: state.clone(),
             country: country.clone(),
+            ocr: ocr.clone(),
             taken_after: taken_after.clone(),
             taken_before: taken_before.clone(),
             asset_type: args.r#type.map(|t| t.as_api_str().to_string()),
@@ -466,6 +475,7 @@ mod tests {
             city: None,
             state: None,
             country: None,
+            ocr: None,
             r#type: None,
             limit: 1000,
             format: OutputFormat::Paths,
@@ -558,6 +568,13 @@ mod tests {
     fn validate_accepts_type_only() {
         let mut args = default_args();
         args.r#type = Some(AssetTypeArg::Video);
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_ocr_only() {
+        let mut args = default_args();
+        args.ocr = Some("hello".into());
         assert!(args.validate().is_ok());
     }
 
@@ -764,6 +781,17 @@ mod tests {
             calls[0].taken_before.as_deref(),
             Some("2025-12-31T23:59:59.999Z")
         );
+    }
+
+    #[test]
+    fn fetch_sends_ocr_filter_through_trimmed() {
+        let backend = FakeBackend::new(vec![resp(vec![], None)]);
+        let mut args = default_args();
+        args.ocr = Some("  上海市老年基金会  ".into());
+        fetch_assets(&backend, &args).unwrap();
+        let calls = backend.calls();
+        // Whitespace is stripped just like every other string filter.
+        assert_eq!(calls[0].ocr.as_deref(), Some("上海市老年基金会"));
     }
 
     #[test]

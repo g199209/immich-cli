@@ -23,6 +23,12 @@ pub struct SearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
 
+    /// Substring filter on Immich's OCR-detected text. Both `/metadata`
+    /// and `/smart` endpoints accept this; matching is case-sensitive
+    /// substring and supports Unicode (Chinese, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ocr: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub taken_after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
