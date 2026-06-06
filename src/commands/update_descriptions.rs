@@ -8,8 +8,9 @@
 //!   * footer + sha matches asset.checksum + version matches → skip
 //!   * footer with stale sha (file changed)       → re-caption
 //!   * footer with older version                  → re-caption
-//!   * non-empty description without our footer   → skip by default
-//!     (camera noise or human-written), override with --overwrite-existing
+//!   * non-empty description without our footer   → caption (overwrite
+//!     the foreign value — in this library it's always camera/app noise
+//!     like `cof`, `PixCake`, `Exif_JPEG_420`, never a real human caption)
 //!
 //! `--force` ignores even the "sha matches" check, useful when iterating
 //! on the prompt without bumping the version constant.
@@ -81,12 +82,6 @@ pub struct UpdateDescriptionsArgs {
     /// NOT PUT anything back to Immich.
     #[arg(long)]
     pub dry_run: bool,
-
-    /// Also caption assets that already have a non-empty description
-    /// from somewhere else (camera EXIF, a human edit, etc.). Without
-    /// this flag we treat any non-footer description as untouchable.
-    #[arg(long)]
-    pub overwrite_existing: bool,
 
     /// Ignore the "sha and version match → skip" rule. Useful when
     /// re-prompting the same library without bumping CURRENT_VERSION.
@@ -193,15 +188,9 @@ pub enum CaptionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     UpToDate,
-    ForeignDescription,
 }
 
-pub fn decide(
-    description: Option<&str>,
-    checksum: &str,
-    overwrite_existing: bool,
-    force: bool,
-) -> Decision {
+pub fn decide(description: Option<&str>, checksum: &str, force: bool) -> Decision {
     let desc = description.unwrap_or("").trim();
     if desc.is_empty() {
         return Decision::Caption(CaptionReason::EmptyDescription);
@@ -220,14 +209,8 @@ pub fn decide(
                 Decision::Skip(SkipReason::UpToDate)
             }
         }
-        None => {
-            // Someone else wrote this (camera EXIF or a human).
-            if overwrite_existing {
-                Decision::Caption(CaptionReason::OverwroteForeign)
-            } else {
-                Decision::Skip(SkipReason::ForeignDescription)
-            }
-        }
+        // No footer = camera EXIF / app noise; always overwrite.
+        None => Decision::Caption(CaptionReason::OverwroteForeign),
     }
 }
 
@@ -408,7 +391,7 @@ where
         .into_iter()
         .map(|a| {
             let desc = a.exif_info.as_ref().and_then(|e| e.description.as_deref());
-            let dec = decide(desc, &a.checksum, args.overwrite_existing, args.force);
+            let dec = decide(desc, &a.checksum, args.force);
             (a, dec)
         })
         .collect();
@@ -423,31 +406,14 @@ where
         })
         .collect();
 
-    // Always report skips so users see what was untouched.
-    let mut skipped_up_to_date = 0usize;
-    let mut skipped_foreign = 0usize;
-    for (asset, dec) in &planned {
-        if let Decision::Skip(r) = dec {
-            match r {
-                SkipReason::UpToDate => skipped_up_to_date += 1,
-                SkipReason::ForeignDescription => skipped_foreign += 1,
-            }
-            // Only log foreign skips loudly; up-to-date is the common case.
-            if matches!(r, SkipReason::ForeignDescription) {
-                writeln!(
-                    log,
-                    "skip (foreign description, --overwrite-existing to caption): {} {}",
-                    asset.id, asset.original_path
-                )
-                .ok();
-            }
-        }
-    }
+    let skipped_up_to_date = planned
+        .iter()
+        .filter(|(_, d)| matches!(d, Decision::Skip(SkipReason::UpToDate)))
+        .count();
     writeln!(
         log,
-        "{} up to date, {} foreign (skipped), {} to caption",
+        "{} up to date, {} to caption",
         skipped_up_to_date,
-        skipped_foreign,
         work.len()
     )
     .ok();
@@ -653,9 +619,9 @@ mod tests {
 
     #[test]
     fn decide_caption_when_description_is_none_or_empty() {
-        let d1 = decide(None, "abc", false, false);
-        let d2 = decide(Some(""), "abc", false, false);
-        let d3 = decide(Some("   "), "abc", false, false);
+        let d1 = decide(None, "abc", false);
+        let d2 = decide(Some(""), "abc", false);
+        let d3 = decide(Some("   "), "abc", false);
         for d in [d1, d2, d3] {
             assert_eq!(d, Decision::Caption(CaptionReason::EmptyDescription));
         }
@@ -664,14 +630,14 @@ mod tests {
     #[test]
     fn decide_skip_when_up_to_date() {
         let footer = assemble_with_footer("正文", "abcdef123456xyz");
-        let d = decide(Some(&footer), "abcdef123456xyz", false, false);
+        let d = decide(Some(&footer), "abcdef123456xyz", false);
         assert_eq!(d, Decision::Skip(SkipReason::UpToDate));
     }
 
     #[test]
     fn decide_recaption_when_sha_changes() {
         let footer = assemble_with_footer("正文", "OLD_CHECKSUM_____");
-        let d = decide(Some(&footer), "NEW_CHECKSUM_____", false, false);
+        let d = decide(Some(&footer), "NEW_CHECKSUM_____", false);
         assert_eq!(d, Decision::Caption(CaptionReason::ChecksumChanged));
     }
 
@@ -681,27 +647,30 @@ mod tests {
             "正文\n\n—generated by immich-cli/v0 sha={}",
             sha_prefix("abc")
         );
-        let d = decide(Some(&s), "abc", false, false);
+        let d = decide(Some(&s), "abc", false);
         assert_eq!(d, Decision::Caption(CaptionReason::VersionUpgraded));
     }
 
     #[test]
-    fn decide_skip_foreign_by_default() {
-        let d = decide(Some("cof"), "abc", false, false);
-        assert_eq!(d, Decision::Skip(SkipReason::ForeignDescription));
-    }
-
-    #[test]
-    fn decide_overwrite_foreign_when_flag_set() {
-        let d = decide(Some("a human-written caption"), "abc", true, false);
-        assert_eq!(d, Decision::Caption(CaptionReason::OverwroteForeign));
+    fn decide_caption_when_foreign_description() {
+        // No footer = camera noise; always overwrite.
+        for s in ["cof", "PixCake", "Exif_JPEG_420", "a human-written caption"] {
+            let d = decide(Some(s), "abc", false);
+            assert_eq!(
+                d,
+                Decision::Caption(CaptionReason::OverwroteForeign),
+                "input: {s}"
+            );
+        }
     }
 
     #[test]
     fn decide_force_overrides_uptodate() {
         let footer = assemble_with_footer("正文", "abcdef123456xyz");
-        let d = decide(Some(&footer), "abcdef123456xyz", false, true);
-        assert_eq!(d, Decision::Caption(CaptionReason::Forced));
+        let d = decide(Some(&footer), "abcdef123456xyz", false);
+        assert_eq!(d, Decision::Skip(SkipReason::UpToDate));
+        let forced = decide(Some(&footer), "abcdef123456xyz", true);
+        assert_eq!(forced, Decision::Caption(CaptionReason::Forced));
     }
 
     // ---- end-to-end via run_with ----
@@ -797,13 +766,12 @@ mod tests {
             limit: 0,
             parallel: 2,
             dry_run: false,
-            overwrite_existing: false,
             force: false,
         }
     }
 
     #[test]
-    fn run_with_captions_empty_descriptions_only() {
+    fn run_with_captions_empty_and_foreign_descriptions() {
         let search = FakeSearch::new(vec![bucket(vec![
             asset_with("a", "/mnt/qnap/a.jpg", "cs-a-xxxxx", None),
             asset_with("b", "/mnt/qnap/b.jpg", "cs-b-xxxxx", Some("cof")),
@@ -821,14 +789,16 @@ mod tests {
         let mut log = Vec::new();
         run_with(&cfg(), &search, &caption, &vision, args(), &mut log).unwrap();
 
-        let updates = caption.updates.lock().unwrap();
-        // Only asset 'a' (empty) should have been captioned. 'b' is
-        // foreign-skipped, 'c' is up-to-date.
-        assert_eq!(updates.len(), 1, "got: {updates:?}");
+        let mut updates = caption.updates.lock().unwrap().clone();
+        updates.sort_by(|a, b| a.0.cmp(&b.0));
+        // 'a' (empty) and 'b' (foreign noise) both captioned; 'c' up-to-date.
+        assert_eq!(updates.len(), 2, "got: {updates:?}");
         assert_eq!(updates[0].0, "a");
-        assert!(updates[0].1.contains("新描述"));
-        assert!(updates[0].1.contains("—generated by immich-cli/v"));
-        assert!(updates[0].1.contains("sha=cs-a-xxxxx"));
+        assert_eq!(updates[1].0, "b");
+        for u in &updates {
+            assert!(u.1.contains("新描述"));
+            assert!(u.1.contains("—generated by immich-cli/v"));
+        }
 
         let log_s = String::from_utf8(log).unwrap();
         assert!(log_s.contains("up to date"), "{log_s}");
@@ -851,25 +821,6 @@ mod tests {
         assert!(caption.updates.lock().unwrap().is_empty());
         let log_s = String::from_utf8(log).unwrap();
         assert!(log_s.contains("DRY-RUN"));
-    }
-
-    #[test]
-    fn run_with_overwrite_existing_replaces_foreign() {
-        let search = FakeSearch::new(vec![bucket(vec![asset_with(
-            "a",
-            "/mnt/qnap/a.jpg",
-            "cs-a",
-            Some("cof"),
-        )])]);
-        let caption = FakeCaption::new();
-        let vision = FakeVision {
-            reply: "新内容".into(),
-        };
-        let mut a = args();
-        a.overwrite_existing = true;
-        let mut log = Vec::new();
-        run_with(&cfg(), &search, &caption, &vision, a, &mut log).unwrap();
-        assert_eq!(caption.updates.lock().unwrap().len(), 1);
     }
 
     #[test]

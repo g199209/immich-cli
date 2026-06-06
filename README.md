@@ -153,7 +153,7 @@ On a future run we parse the footer and decide per asset:
 | Footer present, sha matches asset.checksum, version matches | **Skip** |
 | Footer present, sha differs | Re-caption (file changed) |
 | Footer present, older version | Re-caption (prompt/model upgraded) |
-| Non-empty without footer (camera noise like `cof`, or human-written) | Skip — pass `--overwrite-existing` to replace |
+| Non-empty without footer (camera/app noise like `cof`, `PixCake`, `Exif_JPEG_420`) | Caption (overwrite) |
 
 `--force` ignores the sha check, useful when iterating on the prompt
 without bumping `CURRENT_VERSION`.
