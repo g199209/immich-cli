@@ -83,14 +83,14 @@ gave you). The default text output is grep-friendly and grouped under
 `File`, `Times`, `Location`, `Camera`, `People`, `Tags`, `OCR`, `Albums`.
 
 ```bash
-immich-cli info ~/QNAP-Photos/PYL/2018年/IMG_20180908_185429.jpg
+immich-cli info ~/QNAP-Photos/Family/2018年/IMG_20180908_185429.jpg
 ```
 
 For automation, use `--format json`. The body is the full Immich asset
 detail plus three added top-level fields: `localPath`, `albums`, `ocr`.
 
 ```bash
-immich-cli info ~/QNAP-Photos/PYL/2018年/IMG_20180908_185429.jpg --format json \
+immich-cli info ~/QNAP-Photos/Family/2018年/IMG_20180908_185429.jpg --format json \
   | jq '{id, localPath, gps: .exifInfo.latitude, people: [.people[].name]}'
 ```
 

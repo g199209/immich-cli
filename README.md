@@ -124,10 +124,10 @@ description, duplicate id, stack, etc.).
 
 ```bash
 # Default: structured text, readable by humans, LLMs, and grep
-immich-cli info ~/QNAP-Photos/PYL/2018年/IMG_20180908_185429.jpg
+immich-cli info ~/QNAP-Photos/Family/2018年/IMG_20180908_185429.jpg
 
 # Full raw asset detail as pretty JSON, for automation
-immich-cli info ~/QNAP-Photos/PYL/2018年/IMG_20180908_185429.jpg --format json | \
+immich-cli info ~/QNAP-Photos/Family/2018年/IMG_20180908_185429.jpg --format json | \
     jq '{id, localPath, lat: .exifInfo.latitude, people: [.people[].name]}'
 ```
 
@@ -158,7 +158,7 @@ the model not to infer unseen visual details from that metadata.
 
 ```bash
 # One asset (good for trying out)
-immich-cli update-descriptions ~/QNAP-Photos/PYL/2025-12-13/foo.jpg
+immich-cli update-descriptions ~/QNAP-Photos/Family/2025-12-13/foo.jpg
 
 # Whole library, 4 workers in parallel (default)
 immich-cli update-descriptions

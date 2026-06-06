@@ -1268,14 +1268,14 @@ mod tests {
     fn resolve_single_uses_reverse_path_mapping() {
         let search = FakeSearch::new(vec![bucket(vec![asset_with(
             "the-id",
-            "/mnt/qnap/PYL/x.jpg",
+            "/mnt/qnap/Family/x.jpg",
             "cs",
             None,
         )])]);
         let got = resolve_single(
             &cfg(),
             &search,
-            std::path::Path::new("/home/u/Photos/PYL/x.jpg"),
+            std::path::Path::new("/home/u/Photos/Family/x.jpg"),
         )
         .unwrap();
         assert_eq!(got.id, "the-id");

@@ -63,8 +63,8 @@ mod tests {
     #[test]
     fn simple_translation() {
         let m = vec![entry("/mnt/qnap-photos", "/home/u/QNAP-Photos")];
-        let got = translate("/mnt/qnap-photos/PYL/2025/img.jpg", &m).unwrap();
-        assert_eq!(got, PathBuf::from("/home/u/QNAP-Photos/PYL/2025/img.jpg"));
+        let got = translate("/mnt/qnap-photos/Family/2025/img.jpg", &m).unwrap();
+        assert_eq!(got, PathBuf::from("/home/u/QNAP-Photos/Family/2025/img.jpg"));
     }
 
     #[test]
@@ -76,11 +76,11 @@ mod tests {
     #[test]
     fn first_match_wins() {
         let m = vec![
-            entry("/mnt/qnap-photos/PYL", "/local/pyl"),
+            entry("/mnt/qnap-photos/Family", "/local/family"),
             entry("/mnt/qnap-photos", "/local/all"),
         ];
-        let got = translate("/mnt/qnap-photos/PYL/x.jpg", &m).unwrap();
-        assert_eq!(got, PathBuf::from("/local/pyl/x.jpg"));
+        let got = translate("/mnt/qnap-photos/Family/x.jpg", &m).unwrap();
+        assert_eq!(got, PathBuf::from("/local/family/x.jpg"));
     }
 
     #[test]
@@ -92,8 +92,8 @@ mod tests {
     #[test]
     fn reverse_simple() {
         let m = vec![entry("/mnt/qnap-photos", "/home/u/QNAP-Photos")];
-        let got = reverse_translate("/home/u/QNAP-Photos/PYL/2018/x.jpg", &m).unwrap();
-        assert_eq!(got, "/mnt/qnap-photos/PYL/2018/x.jpg");
+        let got = reverse_translate("/home/u/QNAP-Photos/Family/2018/x.jpg", &m).unwrap();
+        assert_eq!(got, "/mnt/qnap-photos/Family/2018/x.jpg");
     }
 
     #[test]
@@ -107,11 +107,11 @@ mod tests {
     #[test]
     fn reverse_first_match_wins() {
         let m = vec![
-            entry("/mnt/q/pyl", "/home/u/Photos/pyl"),
+            entry("/mnt/q/family", "/home/u/Photos/family"),
             entry("/mnt/q", "/home/u/Photos"),
         ];
-        let got = reverse_translate("/home/u/Photos/pyl/x.jpg", &m).unwrap();
-        assert_eq!(got, "/mnt/q/pyl/x.jpg");
+        let got = reverse_translate("/home/u/Photos/family/x.jpg", &m).unwrap();
+        assert_eq!(got, "/mnt/q/family/x.jpg");
     }
 
     #[test]
@@ -122,10 +122,10 @@ mod tests {
 
     #[test]
     fn reverse_handles_unicode_segments() {
-        // Real-world path from the user's library uses Chinese characters.
-        let m = vec![entry("/mnt/qnap-photos", "/home/mingfei/QNAP-Photos")];
+        // Ensure unicode path segments round-trip unchanged.
+        let m = vec![entry("/mnt/qnap-photos", "/home/u/QNAP-Photos")];
         let got =
-            reverse_translate("/home/mingfei/QNAP-Photos/PYL/2018年/IMG_20180908.jpg", &m).unwrap();
-        assert_eq!(got, "/mnt/qnap-photos/PYL/2018年/IMG_20180908.jpg");
+            reverse_translate("/home/u/QNAP-Photos/Family/2018年/IMG_20180908.jpg", &m).unwrap();
+        assert_eq!(got, "/mnt/qnap-photos/Family/2018年/IMG_20180908.jpg");
     }
 }

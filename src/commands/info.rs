@@ -605,8 +605,8 @@ mod tests {
 
     #[test]
     fn find_returns_id_when_single_match() {
-        let s = FakeSearch::new(vec![search_hit("the-id", "/mnt/qnap/PYL/x.jpg")]);
-        let id = find_asset_id(&s, "/mnt/qnap/PYL/x.jpg").unwrap();
+        let s = FakeSearch::new(vec![search_hit("the-id", "/mnt/qnap/Family/x.jpg")]);
+        let id = find_asset_id(&s, "/mnt/qnap/Family/x.jpg").unwrap();
         assert_eq!(id, "the-id");
         // filename used for the search filter:
         assert_eq!(
@@ -619,20 +619,20 @@ mod tests {
     fn find_disambiguates_filename_collision_by_path() {
         let s = FakeSearch::new(vec![search_multi(vec![
             ("wrong-id", "/mnt/qnap/OTHER/x.jpg"),
-            ("right-id", "/mnt/qnap/PYL/x.jpg"),
+            ("right-id", "/mnt/qnap/Family/x.jpg"),
         ])]);
-        let id = find_asset_id(&s, "/mnt/qnap/PYL/x.jpg").unwrap();
+        let id = find_asset_id(&s, "/mnt/qnap/Family/x.jpg").unwrap();
         assert_eq!(id, "right-id");
     }
 
     #[test]
     fn find_errors_when_no_match() {
         let s = FakeSearch::new(vec![search_multi(vec![])]);
-        let err = find_asset_id(&s, "/mnt/qnap/PYL/x.jpg")
+        let err = find_asset_id(&s, "/mnt/qnap/Family/x.jpg")
             .unwrap_err()
             .to_string();
         assert!(err.contains("no Immich asset"), "got: {err}");
-        assert!(err.contains("/mnt/qnap/PYL/x.jpg"), "got: {err}");
+        assert!(err.contains("/mnt/qnap/Family/x.jpg"), "got: {err}");
     }
 
     #[test]
@@ -640,10 +640,10 @@ mod tests {
         // Two distinct assets with the exact same server path is a server
         // misindex; report it loudly rather than silently picking one.
         let s = FakeSearch::new(vec![search_multi(vec![
-            ("a", "/mnt/qnap/PYL/x.jpg"),
-            ("b", "/mnt/qnap/PYL/x.jpg"),
+            ("a", "/mnt/qnap/Family/x.jpg"),
+            ("b", "/mnt/qnap/Family/x.jpg"),
         ])]);
-        let err = find_asset_id(&s, "/mnt/qnap/PYL/x.jpg")
+        let err = find_asset_id(&s, "/mnt/qnap/Family/x.jpg")
             .unwrap_err()
             .to_string();
         assert!(err.contains("share originalPath"), "got: {err}");
@@ -672,7 +672,7 @@ mod tests {
     fn sample_asset() -> Value {
         serde_json::json!({
             "id": "asset-1",
-            "originalPath": "/mnt/qnap/PYL/2018/IMG_20180908_185429.jpg",
+            "originalPath": "/mnt/qnap/Family/2018/IMG_20180908_185429.jpg",
             "originalFileName": "IMG_20180908_185429.jpg",
             "originalMimeType": "image/jpeg",
             "type": "IMAGE",
@@ -732,7 +732,7 @@ mod tests {
         format: OutputFormat,
     ) -> String {
         let server_path = asset["originalPath"].as_str().unwrap().to_owned();
-        let local_path = "/home/u/Photos/PYL/2018/IMG_20180908_185429.jpg";
+        let local_path = "/home/u/Photos/Family/2018/IMG_20180908_185429.jpg";
         let search = FakeSearch::new(vec![search_hit("asset-1", &server_path)]);
         let info = FakeInfo {
             asset,
@@ -936,7 +936,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             parsed["localPath"],
-            "/home/u/Photos/PYL/2018/IMG_20180908_185429.jpg"
+            "/home/u/Photos/Family/2018/IMG_20180908_185429.jpg"
         );
         assert!(parsed["albums"].is_array());
         assert_eq!(parsed["originalMimeType"], "image/jpeg");
