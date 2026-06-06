@@ -544,6 +544,7 @@ mod tests {
             }],
             timeout_secs: 60,
             llm: None,
+            people: std::collections::BTreeMap::new(),
         }
     }
 

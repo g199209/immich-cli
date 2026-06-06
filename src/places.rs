@@ -110,7 +110,10 @@ pub fn load_admin2_lookup(path: &Path) -> Result<Admin2Lookup> {
             (Some(c), Some(s), Some(ci), Some(a2))
                 if !c.is_empty() && !s.is_empty() && !ci.is_empty() && !a2.is_empty() =>
             {
-                out.insert((c.to_string(), s.to_string(), ci.to_string()), a2.to_string());
+                out.insert(
+                    (c.to_string(), s.to_string(), ci.to_string()),
+                    a2.to_string(),
+                );
             }
             _ => {
                 eprintln!(
@@ -127,7 +130,11 @@ pub fn load_admin2_lookup(path: &Path) -> Result<Admin2Lookup> {
 /// missing from the lookup keep `admin2 = None` and become orphans.
 pub fn enrich_with_admin2(vocab: &mut [CityVocabEntry], lookup: &Admin2Lookup) {
     for entry in vocab {
-        let key = (entry.country.clone(), entry.state.clone(), entry.city.clone());
+        let key = (
+            entry.country.clone(),
+            entry.state.clone(),
+            entry.city.clone(),
+        );
         if let Some(a2) = lookup.get(&key) {
             entry.admin2 = Some(a2.clone());
         }
@@ -559,7 +566,9 @@ mod tests {
 
     #[test]
     fn resolve_place_returns_parsed_matches() {
-        let llm = FakeLlm::new(&[r#"{"matches":[{"country":"People's Republic of China","state":"Shanghai","city":"Pudong"}]}"#]);
+        let llm = FakeLlm::new(&[
+            r#"{"matches":[{"country":"People's Republic of China","state":"Shanghai","city":"Pudong"}]}"#,
+        ]);
         let places = FakePlaces(sample_vocab());
         let got = resolve_place(&places, &llm, "上海浦东", &Admin2Lookup::new(), false).unwrap();
         assert_eq!(
@@ -574,8 +583,7 @@ mod tests {
 
     #[test]
     fn resolve_place_handles_country_only() {
-        let llm =
-            FakeLlm::new(&[r#"{"matches":[{"country":"People's Republic of China"}]}"#]);
+        let llm = FakeLlm::new(&[r#"{"matches":[{"country":"People's Republic of China"}]}"#]);
         let places = FakePlaces(sample_vocab());
         let got = resolve_place(&places, &llm, "中国", &Admin2Lookup::new(), false).unwrap();
         assert_eq!(got.len(), 1);
@@ -589,12 +597,10 @@ mod tests {
 
     #[test]
     fn resolve_place_returns_multiple_matches() {
-        let llm = FakeLlm::new(&[
-            r#"{"matches":[
+        let llm = FakeLlm::new(&[r#"{"matches":[
                 {"country":"People's Republic of China","state":"Shanghai","city":"Pudong"},
                 {"country":"People's Republic of China","state":"Zhejiang","city":"Andong"}
-            ]}"#,
-        ]);
+            ]}"#]);
         let places = FakePlaces(sample_vocab());
         let got = resolve_place(&places, &llm, "ambiguous", &Admin2Lookup::new(), false).unwrap();
         assert_eq!(got.len(), 2);
@@ -660,7 +666,9 @@ mod tests {
     fn resolve_place_rejects_empty_input() {
         let llm = FakeLlm::new(&[]);
         let places = FakePlaces(sample_vocab());
-        let err = resolve_place(&places, &llm, "   ", &Admin2Lookup::new(), false).unwrap_err().to_string();
+        let err = resolve_place(&places, &llm, "   ", &Admin2Lookup::new(), false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("empty"), "got: {err}");
     }
 

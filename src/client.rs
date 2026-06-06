@@ -10,10 +10,9 @@ pub trait SearchBackend {
     fn search(&self, req: &SearchRequest) -> Result<SearchResponse>;
 }
 
-/// Backend the `update-descriptions` subcommand talks to. Two operations:
-/// pull the Immich-rendered preview thumbnail for an asset (cheap JPEG,
-/// already orientation-corrected, no HEIC/RAW handling on our side) and
-/// PUT a new description back.
+/// Thumbnail/write half of the `update-descriptions` backend. The command
+/// also uses [`InfoBackend`] when configured people mappings require full
+/// asset detail.
 pub trait CaptionBackend {
     /// `GET /api/assets/{id}/thumbnail?size=thumbnail` — returns a small
     /// JPEG (~720x960) ready to send to a vision model.

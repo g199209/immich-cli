@@ -175,7 +175,15 @@ pub fn run(cfg: &Config, args: SearchArgs) -> Result<()> {
     };
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    run_with(cfg, &client, &client, llm.as_ref(), &lookup, &args, &mut out)
+    run_with(
+        cfg,
+        &client,
+        &client,
+        llm.as_ref(),
+        &lookup,
+        &args,
+        &mut out,
+    )
 }
 
 /// Test/library entry. Decouples the runtime from concrete clients so
@@ -1308,7 +1316,8 @@ mod tests {
         args.taken_after = Some("2025-01-01".into());
         // LLM provided but should NOT be used (no -q, no --place).
         let llm = FakeLlm::new(&[]);
-        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let got =
+            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
         assert_eq!(got.assets.len(), 1);
         // Only the CLIP/metadata path call, never the description workflow.
         assert_eq!(backend.calls().len(), 1);
@@ -1322,7 +1331,9 @@ mod tests {
         )]);
         let mut args = default_args();
         args.query = Some("elephants".into());
-        let got = perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args).unwrap();
+        let got =
+            perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args)
+                .unwrap();
         assert_eq!(got.assets.len(), 1);
         assert_eq!(backend.calls().len(), 1);
         // The single call was to /smart (query is set).
@@ -1335,9 +1346,10 @@ mod tests {
         let mut args = default_args();
         args.query = Some("elephants".into());
         args.description_only = true;
-        let err = perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args)
-            .unwrap_err()
-            .to_string();
+        let err =
+            perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args)
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("[llm]"), "got: {err}");
     }
 
@@ -1351,7 +1363,8 @@ mod tests {
         args.query = Some("elephants".into());
         args.description_only = true;
         let llm = FakeLlm::new(&[r#"{"keywords":["大象"]}"#, r#"{"ids":["a"]}"#]);
-        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let got =
+            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
         assert_eq!(got.assets.len(), 1);
         assert_eq!(got.assets[0].id, "a");
         // Exactly 1 search call: per-keyword. No CLIP call.
@@ -1387,7 +1400,8 @@ mod tests {
         let mut args = default_args();
         args.query = Some("elephants".into());
         let llm = FakeLlm::new(&[r#"{"keywords":["大象"]}"#, r#"{"ids":["c","b"]}"#]);
-        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let got =
+            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
         let ids: Vec<&str> = got.assets.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["b", "a", "c"]);
     }
@@ -1436,7 +1450,8 @@ mod tests {
             r#"{"keywords":["大象"]}"#,
             // rerank never called because candidates is empty
         ]);
-        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let got =
+            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
         assert_eq!(got.assets.len(), 1);
         assert_eq!(got.assets[0].id, "a");
     }
@@ -1448,9 +1463,10 @@ mod tests {
         let backend = FakeBackend::new(vec![]);
         let mut args = default_args();
         args.place = Some("上海".into());
-        let err = perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args)
-            .unwrap_err()
-            .to_string();
+        let err =
+            perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args)
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("--place"), "got: {err}");
         assert!(err.contains("[llm]"), "got: {err}");
     }
@@ -1465,9 +1481,9 @@ mod tests {
         .with_vocab(sample_vocab());
         let mut args = default_args();
         args.place = Some("中国".into());
-        let llm =
-            FakeLlm::new(&[r#"{"matches":[{"country":"People's Republic of China"}]}"#]);
-        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let llm = FakeLlm::new(&[r#"{"matches":[{"country":"People's Republic of China"}]}"#]);
+        let got =
+            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
         assert_eq!(got.assets.len(), 1);
         let calls = backend.calls();
         assert_eq!(calls.len(), 1);
@@ -1518,7 +1534,8 @@ mod tests {
             {"country":"People's Republic of China","state":"Shanghai","city":"Pudong"},
             {"country":"People's Republic of China","state":"Zhejiang","city":"Andong"}
         ]}"#]);
-        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let got =
+            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
         // RRF: b appears in both lists (rank 2 in each) → top.
         let ids: Vec<&str> = got.assets.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids[0], "b");

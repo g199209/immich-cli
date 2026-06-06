@@ -21,3 +21,14 @@ local  = "~/QNAP-Photos"
 # model        = "deepseek-v4-flash"   # text model, for `ask`
 # vision_model = "mimo-v2.5"           # vision model, for `update-descriptions`
 # timeout_secs = 120
+
+# Optional: Immich face-recognition names to relationship labels used by
+# `update-descriptions`. Only names listed here are sent to the captioning
+# prompt; every other detected face is ignored.
+# [people]
+# "ImmichPersonSpouse" = ["妻子", "妈妈"]
+# "ImmichPersonSelf" = ["丈夫", "爸爸"]
+# "ImmichPersonChild" = ["女儿", "孩子"]
+# "ImmichPersonMotherInLaw" = ["岳母", "外婆"]
+# "ImmichPersonMother" = ["母亲", "妈妈", "奶奶"]
+# "ImmichPersonFather" = ["父亲", "爸爸", "爷爷"]

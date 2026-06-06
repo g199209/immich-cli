@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Clone)]
@@ -17,6 +18,11 @@ pub struct Config {
     /// `ask` subcommand needs this; everything else ignores it.
     #[serde(default)]
     pub llm: Option<LlmConfig>,
+    /// Immich person-name to searchable relationship labels. Used by
+    /// `update-descriptions` to give the captioning LLM objective,
+    /// user-curated identity context without changing Immich's own names.
+    #[serde(default)]
+    pub people: BTreeMap<String, Vec<String>>,
 }
 
 /// LLM endpoint config. Currently expected to speak the OpenAI
@@ -98,6 +104,23 @@ impl Config {
             }
         }
 
+        cfg.people = cfg
+            .people
+            .into_iter()
+            .filter_map(|(name, roles)| {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return None;
+                }
+                let roles = roles
+                    .into_iter()
+                    .map(|r| r.trim().to_string())
+                    .filter(|r| !r.is_empty())
+                    .collect();
+                Some((name, roles))
+            })
+            .collect();
+
         Ok(cfg)
     }
 }
@@ -148,6 +171,7 @@ api_key = "abc"
         assert_eq!(cfg.api_key, "abc");
         assert!(cfg.path_map.is_empty());
         assert_eq!(cfg.timeout_secs, 60);
+        assert!(cfg.people.is_empty());
     }
 
     #[test]
@@ -174,6 +198,31 @@ local  = "/home/u/B"
         assert_eq!(cfg.path_map[0].local, "/home/u/A");
         assert_eq!(cfg.path_map[1].server, "/mnt/b");
         assert_eq!(cfg.path_map[1].local, "/home/u/B");
+    }
+
+    #[test]
+    fn parses_people_mapping_and_trims_empty_values() {
+        let f = write_config(
+            r#"
+server_url = "http://x"
+api_key = "k"
+
+[people]
+" 测试人物甲 " = ["妻子", " 妈妈 ", ""]
+"" = ["ignored"]
+"测试人物乙" = ["女儿", "孩子"]
+"#,
+        );
+        let cfg = Config::load(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.people.get("测试人物甲").cloned(),
+            Some(vec!["妻子".into(), "妈妈".into()])
+        );
+        assert_eq!(
+            cfg.people.get("测试人物乙").cloned(),
+            Some(vec!["女儿".into(), "孩子".into()])
+        );
+        assert!(!cfg.people.contains_key(""));
     }
 
     #[test]
