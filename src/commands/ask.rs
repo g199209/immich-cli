@@ -117,23 +117,28 @@ struct KeywordsReply {
 }
 
 const KEYWORD_SYSTEM_PROMPT: &str = "\
-You extract substring search keywords from a Chinese/English natural-language \
-photo-search query. Photo descriptions are rich narrative text describing the \
-visual content.\n\n\
+You extract substring search keywords from a natural-language photo-search query.\n\n\
+IMPORTANT — the photo descriptions you'll match against are ALWAYS written in \
+Chinese. Substring matching is literal, so keywords must be the Chinese forms \
+that actually appear in the descriptions. Translate the user's intent into \
+Chinese before extracting keywords, regardless of the query language.\n\n\
 Your output MUST be a single JSON object of the form: \
 {\"keywords\": [\"...\", \"...\"]}\n\n\
 Rules:\n\
 - Up to 16 keywords. Quality > quantity.\n\
-- Each keyword should be a short noun phrase (1-8 characters/words) that is \
-LIKELY to appear verbatim inside a photo description.\n\
-- Include explicit entities and concrete descriptors (大象, elephant, 草原, \
-野生动物, 夕阳, savannah, sunset).\n\
-- Include synonyms and lexical variants of the central concepts (大象, 象群, \
-一群象, herd of elephants).\n\
-- For Chinese queries, output Chinese keywords. For English queries, output \
-English. For mixed queries, output both.\n\
-- Do NOT include function words, abstract verbs, or generic words like \"照片\", \
-\"图片\", \"看看\", \"want\", \"see\".";
+- Output keywords in Chinese (e.g. sunset → 夕阳/日落, elephant → 大象, \
+sailing boat → 帆船, savannah → 草原).\n\
+- Each keyword is a short noun phrase (1-8 Chinese characters) likely to \
+appear verbatim inside a Chinese description.\n\
+- Include synonyms and lexical variants of central concepts (大象, 象群, \
+一群大象). For sunset, include both 夕阳 and 日落. For night cityscapes, \
+include 夜景 and 灯光.\n\
+- The ONLY exception to Chinese-only output is proper nouns and brand names \
+that are conventionally written in English even inside Chinese text \
+(e.g. \"DELL\", \"iPhone\", \"BMW\", model numbers). Include both forms \
+only if both are plausibly used in Chinese descriptions.\n\
+- Do NOT include function words, abstract verbs, or generic words like \
+\"照片\", \"图片\", \"看看\", \"想\".";
 
 fn expand_keywords<L: ChatBackend>(llm: &L, query: &str) -> Result<Vec<String>> {
     let messages = [
