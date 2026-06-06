@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::models::{SearchRequest, SearchResponse};
-use anyhow::{bail, Context, Result};
+use crate::places::CityVocabEntry;
+use anyhow::{anyhow, bail, Context, Result};
 use std::time::Duration;
 
 /// Backend the search command talks to. The trait exists so tests can swap
@@ -22,6 +23,16 @@ pub trait CaptionBackend {
     /// API token to have the `asset.update` permission scope; without it
     /// the server returns 403.
     fn update_description(&self, id: &str, description: &str) -> Result<()>;
+}
+
+/// Backend exposing the library's geocoded vocabulary, used to resolve
+/// the user's free-form `--place "..."` input to Immich's exact-match
+/// city/state/country values. The endpoint `/api/search/cities` returns
+/// one asset per distinct (city, state, country) tuple in the library —
+/// effectively a free enumeration of every place name Immich knows
+/// about, without us having to walk the whole asset table.
+pub trait PlacesBackend {
+    fn cities_vocabulary(&self) -> Result<Vec<CityVocabEntry>>;
 }
 
 /// Backend the `info` subcommand talks to. Separate from `SearchBackend`
@@ -145,6 +156,34 @@ impl InfoBackend for ImmichClient {
 
     fn ocr_for_asset(&self, id: &str) -> Result<serde_json::Value> {
         self.get_json(&format!("/api/assets/{id}/ocr"))
+    }
+}
+
+impl PlacesBackend for ImmichClient {
+    fn cities_vocabulary(&self) -> Result<Vec<CityVocabEntry>> {
+        let raw = self.get_json("/api/search/cities")?;
+        let arr = raw
+            .as_array()
+            .ok_or_else(|| anyhow!("/api/search/cities did not return an array"))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for asset in arr {
+            let exif = &asset["exifInfo"];
+            let city = exif["city"].as_str().unwrap_or("");
+            let state = exif["state"].as_str().unwrap_or("");
+            let country = exif["country"].as_str().unwrap_or("");
+            // Immich's filter is exact-match on all three fields; an
+            // entry with any field empty cannot be matched, so drop it.
+            if city.is_empty() || state.is_empty() || country.is_empty() {
+                continue;
+            }
+            out.push(CityVocabEntry {
+                country: country.into(),
+                state: state.into(),
+                city: city.into(),
+                admin2: None,
+            });
+        }
+        Ok(out)
     }
 }
 

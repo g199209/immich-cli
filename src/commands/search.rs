@@ -1,9 +1,10 @@
-use crate::client::{ImmichClient, SearchBackend};
+use crate::client::{ImmichClient, PlacesBackend, SearchBackend};
 use crate::config::{Config, PathMapEntry};
 use crate::description_search::{self, HardFilters};
 use crate::llm::{ChatBackend, OpenAiClient};
 use crate::models::{Asset, SearchRequest};
 use crate::path_map;
+use crate::places::{self, Admin2Lookup, PlaceMatch};
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
@@ -35,17 +36,14 @@ pub struct SearchArgs {
     #[arg(long, value_name = "DATE")]
     pub taken_before: Option<String>,
 
-    /// Filter by city as recorded in EXIF (Immich does an exact match).
+    /// Free-form natural-language place ("上海", "Shanghai Pudong",
+    /// "中国 内蒙古", "Japan"). Resolved against the library's actual
+    /// geocoded vocabulary via the LLM, then turned into one or more
+    /// exact-match city/state/country queries against Immich, merged by
+    /// Reciprocal Rank Fusion if more than one entry matches. Requires
+    /// `[llm]` in config.
     #[arg(long)]
-    pub city: Option<String>,
-
-    /// Filter by state/province as recorded in EXIF (exact match).
-    #[arg(long)]
-    pub state: Option<String>,
-
-    /// Filter by country as recorded in EXIF (exact match).
-    #[arg(long)]
-    pub country: Option<String>,
+    pub place: Option<String>,
 
     /// Substring match against text Immich's OCR detected in the image.
     /// Case-sensitive, Unicode-aware. Combines with --query and the
@@ -79,6 +77,12 @@ pub struct SearchArgs {
     /// output (otherwise they are skipped with a stderr warning).
     #[arg(long)]
     pub include_unmapped: bool,
+
+    /// Print a detailed trace of what the CLI did to stderr: vocabulary
+    /// size, full LLM prompt + raw reply, parsed matches, and per-place
+    /// Immich call counts. Useful when `--place` resolution is surprising.
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -123,9 +127,7 @@ impl SearchArgs {
         non_blank(&self.query)
             || non_blank(&self.taken_after)
             || non_blank(&self.taken_before)
-            || non_blank(&self.city)
-            || non_blank(&self.state)
-            || non_blank(&self.country)
+            || non_blank(&self.place)
             || non_blank(&self.ocr)
             || self.r#type.is_some()
     }
@@ -137,7 +139,7 @@ impl SearchArgs {
         if !self.has_filter() {
             bail!(
                 "search requires at least one filter: --query, --taken-after, \
-                 --taken-before, --city, --state, --country, --ocr, or --type"
+                 --taken-before, --place, --ocr, or --type"
             );
         }
         Ok(())
@@ -167,32 +169,146 @@ pub fn run(cfg: &Config, args: SearchArgs) -> Result<()> {
     args.validate()?;
     let client = ImmichClient::new(cfg)?;
     let llm = cfg.llm.as_ref().map(OpenAiClient::new).transpose()?;
+    let lookup = match places::default_admin2_lookup_path() {
+        Some(p) => places::load_admin2_lookup(&p)?,
+        None => Admin2Lookup::new(),
+    };
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    run_with(cfg, &client, llm.as_ref(), &args, &mut out)
+    run_with(cfg, &client, &client, llm.as_ref(), &lookup, &args, &mut out)
 }
 
 /// Test/library entry. Decouples the runtime from concrete clients so
 /// we can swap in fakes.
-pub fn run_with<S, L, W>(
+pub fn run_with<S, P, L, W>(
     cfg: &Config,
     search_be: &S,
+    places_be: &P,
     llm: Option<&L>,
+    admin2_lookup: &Admin2Lookup,
     args: &SearchArgs,
     out: &mut W,
 ) -> Result<()>
 where
     S: SearchBackend,
+    P: PlacesBackend,
     L: ChatBackend,
     W: std::io::Write,
 {
-    let result = perform_search(search_be, llm, args)?;
+    let result = perform_search(search_be, places_be, llm, admin2_lookup, args)?;
     emit_to_writer(&cfg.path_map, args, &result, out)
 }
 
-/// Decide which path(s) to run based on flags + config presence, then
-/// merge if both ran.
-fn perform_search<S, L>(search_be: &S, llm: Option<&L>, args: &SearchArgs) -> Result<FetchResult>
+/// Top-level dispatcher: resolve `--place` (if set) to one or more
+/// concrete (city, state, country) tuples, run the CLIP+description
+/// flow once per tuple, then RRF-merge across tuples. With no `--place`,
+/// the flow runs exactly once with no geo filter.
+fn perform_search<S, P, L>(
+    search_be: &S,
+    places_be: &P,
+    llm: Option<&L>,
+    admin2_lookup: &Admin2Lookup,
+    args: &SearchArgs,
+) -> Result<FetchResult>
+where
+    S: SearchBackend,
+    P: PlacesBackend,
+    L: ChatBackend,
+{
+    let places = resolve_places(places_be, llm, admin2_lookup, args)?;
+
+    if places.len() == 1 {
+        let r = perform_search_for_place(search_be, llm, args, &places[0])?;
+        if args.verbose {
+            eprintln!(
+                "[verbose] search: returned {} asset(s){}",
+                r.assets.len(),
+                if r.truncated { " (truncated)" } else { "" }
+            );
+        }
+        return Ok(r);
+    }
+
+    // Multiple resolved places: run the full flow per place and merge.
+    let mut per_place: Vec<Vec<Asset>> = Vec::with_capacity(places.len());
+    let mut any_truncated = false;
+    for (i, p) in places.iter().enumerate() {
+        let r = perform_search_for_place(search_be, llm, args, p)?;
+        if args.verbose {
+            eprintln!(
+                "[verbose] search: place[{}] (country={:?} state={:?} city={:?}) returned {} asset(s){}",
+                i,
+                p.country,
+                p.state,
+                p.city,
+                r.assets.len(),
+                if r.truncated { " (truncated)" } else { "" }
+            );
+        }
+        any_truncated |= r.truncated;
+        per_place.push(r.assets);
+    }
+    let merged = description_search::rrf_merge(&per_place);
+    let limit = args.limit as usize;
+    let truncated = any_truncated || merged.len() > limit;
+    let assets: Vec<Asset> = merged.into_iter().take(limit).collect();
+    if args.verbose {
+        eprintln!(
+            "[verbose] search: RRF-merged {} place(s) → {} asset(s){}",
+            places.len(),
+            assets.len(),
+            if truncated { " (truncated)" } else { "" }
+        );
+    }
+    Ok(FetchResult { assets, truncated })
+}
+
+/// Resolve `--place "..."` to one or more concrete `PlaceMatch`es.
+/// Returns a single empty match (no geo filter) when `--place` is unset.
+fn resolve_places<P, L>(
+    places_be: &P,
+    llm: Option<&L>,
+    admin2_lookup: &Admin2Lookup,
+    args: &SearchArgs,
+) -> Result<Vec<PlaceMatch>>
+where
+    P: PlacesBackend,
+    L: ChatBackend,
+{
+    let Some(input) = cleaned(&args.place) else {
+        return Ok(vec![PlaceMatch::default()]);
+    };
+    let llm = llm.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--place requires an [llm] section in config.toml \
+             (base_url, api_key, model) to resolve the free-form input"
+        )
+    })?;
+    let matches = places::resolve_place(places_be, llm, &input, admin2_lookup, args.verbose)?;
+    if matches.is_empty() {
+        bail!(
+            "no place in the library matches `{input}` — \
+             try a different wording or check the library's geocoding"
+        );
+    }
+    if args.verbose {
+        eprintln!(
+            "[verbose] search: --place {input:?} → {} place match(es) to query",
+            matches.len()
+        );
+    }
+    Ok(matches)
+}
+
+/// Run the CLIP + description flow for one resolved place. This is the
+/// previous `perform_search` body, plus a `PlaceMatch` parameter that
+/// supplies the city/state/country filters.
+fn perform_search_for_place<S, L>(
+    search_be: &S,
+    llm: Option<&L>,
+    args: &SearchArgs,
+    place: &PlaceMatch,
+) -> Result<FetchResult>
 where
     S: SearchBackend,
     L: ChatBackend,
@@ -201,7 +317,7 @@ where
 
     // No -q at all: filter-only, no LLM in play.
     let Some(q) = query.as_deref() else {
-        return fetch_assets(search_be, args);
+        return fetch_assets(search_be, args, place);
     };
 
     // -q is set. Description-only means LLM is mandatory.
@@ -212,7 +328,7 @@ where
                  (base_url, api_key, model)"
             )
         })?;
-        let filters = build_hard_filters(args)?;
+        let filters = build_hard_filters(args, place)?;
         let assets = description_search::run(search_be, llm, q, &filters)?;
         return Ok(FetchResult {
             assets,
@@ -222,11 +338,11 @@ where
 
     // -q is set, both paths allowed. Run CLIP. If LLM is configured,
     // also run description and merge.
-    let clip = fetch_assets(search_be, args)?;
+    let clip = fetch_assets(search_be, args, place)?;
     let Some(llm) = llm else {
         return Ok(clip);
     };
-    let filters = build_hard_filters(args)?;
+    let filters = build_hard_filters(args, place)?;
     let description = description_search::run(search_be, llm, q, &filters)?;
     if description.is_empty() {
         return Ok(clip);
@@ -238,14 +354,15 @@ where
     Ok(FetchResult { assets, truncated })
 }
 
-/// Build the hard-filter bundle the description path needs. Reuses
-/// `cleaned` + date normalization from this module so both paths see
-/// the exact same values.
-fn build_hard_filters(args: &SearchArgs) -> Result<HardFilters> {
+/// Build the hard-filter bundle the description path needs. Geo fields
+/// come from the resolved [`PlaceMatch`]; everything else is read from
+/// `args` (with the same `cleaned` + date normalization the CLIP path
+/// uses, so both see identical values).
+fn build_hard_filters(args: &SearchArgs, place: &PlaceMatch) -> Result<HardFilters> {
     Ok(HardFilters {
-        city: cleaned(&args.city),
-        state: cleaned(&args.state),
-        country: cleaned(&args.country),
+        city: place.city.clone(),
+        state: place.state.clone(),
+        country: place.country.clone(),
         ocr: cleaned(&args.ocr),
         taken_after: cleaned(&args.taken_after)
             .as_deref()
@@ -272,14 +389,19 @@ pub struct FetchResult {
 /// the default --limit of 1000.
 const PAGE_SIZE: u32 = 1000;
 
-pub fn fetch_assets<B: SearchBackend>(backend: &B, args: &SearchArgs) -> Result<FetchResult> {
-    fetch_assets_inner(backend, args, PAGE_SIZE)
+pub fn fetch_assets<B: SearchBackend>(
+    backend: &B,
+    args: &SearchArgs,
+    place: &PlaceMatch,
+) -> Result<FetchResult> {
+    fetch_assets_inner(backend, args, PAGE_SIZE, place)
 }
 
 fn fetch_assets_inner<B: SearchBackend>(
     backend: &B,
     args: &SearchArgs,
     page_size: u32,
+    place: &PlaceMatch,
 ) -> Result<FetchResult> {
     let taken_after = cleaned(&args.taken_after)
         .as_deref()
@@ -290,9 +412,6 @@ fn fetch_assets_inner<B: SearchBackend>(
         .map(normalize_date_end)
         .transpose()?;
     let query = cleaned(&args.query);
-    let city = cleaned(&args.city);
-    let state = cleaned(&args.state);
-    let country = cleaned(&args.country);
     let ocr = cleaned(&args.ocr);
 
     let mut collected: Vec<Asset> = Vec::with_capacity(args.limit as usize);
@@ -303,9 +422,9 @@ fn fetch_assets_inner<B: SearchBackend>(
         let req = SearchRequest {
             query: query.clone(),
             original_file_name: None,
-            city: city.clone(),
-            state: state.clone(),
-            country: country.clone(),
+            city: place.city.clone(),
+            state: place.state.clone(),
+            country: place.country.clone(),
             ocr: ocr.clone(),
             description: None,
             taken_after: taken_after.clone(),
@@ -576,9 +695,7 @@ mod tests {
             description_only: false,
             taken_after: None,
             taken_before: None,
-            city: None,
-            state: None,
-            country: None,
+            place: None,
             ocr: None,
             r#type: None,
             limit: 1000,
@@ -586,7 +703,12 @@ mod tests {
             verify: false,
             include_missing: false,
             include_unmapped: false,
+            verbose: false,
         }
+    }
+
+    fn no_place() -> PlaceMatch {
+        PlaceMatch::default()
     }
 
     fn fr(assets: Vec<Asset>) -> FetchResult {
@@ -603,11 +725,11 @@ mod tests {
         }
     }
 
-    /// Records each call and replays canned responses in order. Optional
-    /// `assert_fn` lets a test verify the request body the backend sees.
+    /// Records each call and replays canned responses in order.
     struct FakeBackend {
         responses: RefCell<Vec<SearchResponse>>,
         calls: RefCell<Vec<SearchRequest>>,
+        vocab: Vec<crate::places::CityVocabEntry>,
     }
 
     impl FakeBackend {
@@ -615,7 +737,12 @@ mod tests {
             Self {
                 responses: RefCell::new(responses),
                 calls: RefCell::new(Vec::new()),
+                vocab: vec![],
             }
+        }
+        fn with_vocab(mut self, vocab: Vec<crate::places::CityVocabEntry>) -> Self {
+            self.vocab = vocab;
+            self
         }
         fn calls(&self) -> Vec<SearchRequest> {
             self.calls.borrow().clone()
@@ -630,6 +757,12 @@ mod tests {
                 anyhow::bail!("FakeBackend ran out of canned responses");
             }
             Ok(q.remove(0))
+        }
+    }
+
+    impl PlacesBackend for FakeBackend {
+        fn cities_vocabulary(&self) -> Result<Vec<crate::places::CityVocabEntry>> {
+            Ok(self.vocab.clone())
         }
     }
 
@@ -700,9 +833,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_whitespace_only_country() {
+    fn validate_rejects_whitespace_only_place() {
         let mut args = default_args();
-        args.country = Some("   ".into());
+        args.place = Some("   ".into());
         let err = args.validate().unwrap_err().to_string();
         assert!(err.contains("at least one filter"), "got: {err}");
     }
@@ -717,19 +850,24 @@ mod tests {
 
     #[test]
     fn blank_strings_are_not_sent_over_the_wire() {
-        // If a real filter is set, any *other* string flag that happens to
-        // be blank must be stripped from the request body — never sent as
-        // an empty match Immich would interpret literally.
+        // Geo now comes from a resolved PlaceMatch, so verify the other
+        // string fields are still stripped of blank values when handed
+        // to Immich. The geo override carries any city/state/country.
         let backend = FakeBackend::new(vec![resp(vec![], None)]);
         let mut args = default_args();
-        args.country = Some("China".into());
-        args.city = Some("   ".into());
+        args.taken_after = Some("2025-01-01".into());
         args.query = Some("".into());
-        fetch_assets(&backend, &args).unwrap();
+        args.ocr = Some("   ".into());
+        let place = PlaceMatch {
+            country: Some("People's Republic of China".into()),
+            ..Default::default()
+        };
+        fetch_assets(&backend, &args, &place).unwrap();
         let req = &backend.calls()[0];
-        assert_eq!(req.country.as_deref(), Some("China"));
-        assert!(req.city.is_none(), "blank city should be stripped");
+        assert_eq!(req.country.as_deref(), Some("People's Republic of China"));
+        assert!(req.city.is_none());
         assert!(req.query.is_none(), "blank query should be stripped");
+        assert!(req.ocr.is_none(), "blank ocr should be stripped");
     }
 
     // ---- Date normalization --------------------------------------------
@@ -786,7 +924,7 @@ mod tests {
 
         // page_size is hard-coded in fetch_assets, so drive the inner
         // entry point directly to exercise multi-page behavior.
-        let got = fetch_assets_inner(&backend, &args, 2).unwrap();
+        let got = fetch_assets_inner(&backend, &args, 2, &no_place()).unwrap();
         assert_eq!(got.assets.len(), 3);
         assert!(!got.truncated, "exhausted result must not be truncated");
         let calls = backend.calls();
@@ -810,10 +948,10 @@ mod tests {
             Some("2"),
         )]);
         let mut args = default_args();
-        args.country = Some("China".into());
+        args.query = Some("x".into());
         args.limit = 2;
 
-        let got = fetch_assets_inner(&backend, &args, 10).unwrap();
+        let got = fetch_assets_inner(&backend, &args, 10, &no_place()).unwrap();
         assert_eq!(got.assets.len(), 2);
         // Leftover items in the same page mean the server still had more
         // to give us — the marker must be raised.
@@ -833,9 +971,9 @@ mod tests {
             Some("2"),
         )]);
         let mut args = default_args();
-        args.country = Some("China".into());
+        args.query = Some("x".into());
         args.limit = 2;
-        let got = fetch_assets_inner(&backend, &args, 2).unwrap();
+        let got = fetch_assets_inner(&backend, &args, 2, &no_place()).unwrap();
         assert_eq!(got.assets.len(), 2);
         assert!(got.truncated);
         assert_eq!(backend.calls().len(), 1);
@@ -853,9 +991,9 @@ mod tests {
             None,
         )]);
         let mut args = default_args();
-        args.country = Some("China".into());
+        args.query = Some("x".into());
         args.limit = 2;
-        let got = fetch_assets_inner(&backend, &args, 2).unwrap();
+        let got = fetch_assets_inner(&backend, &args, 2, &no_place()).unwrap();
         assert_eq!(got.assets.len(), 2);
         assert!(!got.truncated);
     }
@@ -864,18 +1002,23 @@ mod tests {
     fn fetch_sends_geo_and_type_filters_through() {
         let backend = FakeBackend::new(vec![resp(vec![], None)]);
         let mut args = default_args();
-        args.city = Some("Kangqiao".into());
-        args.state = Some("Shanghai".into());
-        args.country = Some("China".into());
         args.r#type = Some(AssetTypeArg::Video);
         args.taken_after = Some("2025-01-01".into());
         args.taken_before = Some("2025-12-31".into());
+        let place = PlaceMatch {
+            country: Some("People's Republic of China".into()),
+            state: Some("Shanghai".into()),
+            city: Some("Kangqiao".into()),
+        };
 
-        fetch_assets(&backend, &args).unwrap();
+        fetch_assets(&backend, &args, &place).unwrap();
         let calls = backend.calls();
         assert_eq!(calls[0].city.as_deref(), Some("Kangqiao"));
         assert_eq!(calls[0].state.as_deref(), Some("Shanghai"));
-        assert_eq!(calls[0].country.as_deref(), Some("China"));
+        assert_eq!(
+            calls[0].country.as_deref(),
+            Some("People's Republic of China")
+        );
         assert_eq!(calls[0].asset_type.as_deref(), Some("VIDEO"));
         assert_eq!(
             calls[0].taken_after.as_deref(),
@@ -892,7 +1035,7 @@ mod tests {
         let backend = FakeBackend::new(vec![resp(vec![], None)]);
         let mut args = default_args();
         args.ocr = Some("  上海市老年基金会  ".into());
-        fetch_assets(&backend, &args).unwrap();
+        fetch_assets(&backend, &args, &no_place()).unwrap();
         let calls = backend.calls();
         // Whitespace is stripped just like every other string filter.
         assert_eq!(calls[0].ocr.as_deref(), Some("上海市老年基金会"));
@@ -908,7 +1051,9 @@ mod tests {
         }
         let mut args = default_args();
         args.query = Some("x".into());
-        let err = fetch_assets(&ErrBackend, &args).unwrap_err().to_string();
+        let err = fetch_assets(&ErrBackend, &args, &no_place())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("immich exploded"), "got: {err}");
     }
 
@@ -1136,6 +1281,23 @@ mod tests {
         a
     }
 
+    fn sample_vocab() -> Vec<crate::places::CityVocabEntry> {
+        vec![
+            crate::places::CityVocabEntry {
+                country: "People's Republic of China".into(),
+                state: "Shanghai".into(),
+                city: "Pudong".into(),
+                admin2: None,
+            },
+            crate::places::CityVocabEntry {
+                country: "People's Republic of China".into(),
+                state: "Zhejiang".into(),
+                city: "Andong".into(),
+                admin2: None,
+            },
+        ]
+    }
+
     #[test]
     fn perform_search_without_query_does_filter_only_no_llm() {
         let backend = FakeBackend::new(vec![resp(
@@ -1143,10 +1305,10 @@ mod tests {
             None,
         )]);
         let mut args = default_args();
-        args.country = Some("China".into());
-        // LLM provided but should NOT be used (no -q).
+        args.taken_after = Some("2025-01-01".into());
+        // LLM provided but should NOT be used (no -q, no --place).
         let llm = FakeLlm::new(&[]);
-        let got = perform_search(&backend, Some(&llm), &args).unwrap();
+        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
         assert_eq!(got.assets.len(), 1);
         // Only the CLIP/metadata path call, never the description workflow.
         assert_eq!(backend.calls().len(), 1);
@@ -1160,7 +1322,7 @@ mod tests {
         )]);
         let mut args = default_args();
         args.query = Some("elephants".into());
-        let got = perform_search::<_, FakeLlm>(&backend, None, &args).unwrap();
+        let got = perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args).unwrap();
         assert_eq!(got.assets.len(), 1);
         assert_eq!(backend.calls().len(), 1);
         // The single call was to /smart (query is set).
@@ -1173,7 +1335,7 @@ mod tests {
         let mut args = default_args();
         args.query = Some("elephants".into());
         args.description_only = true;
-        let err = perform_search::<_, FakeLlm>(&backend, None, &args)
+        let err = perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args)
             .unwrap_err()
             .to_string();
         assert!(err.contains("[llm]"), "got: {err}");
@@ -1189,7 +1351,7 @@ mod tests {
         args.query = Some("elephants".into());
         args.description_only = true;
         let llm = FakeLlm::new(&[r#"{"keywords":["大象"]}"#, r#"{"ids":["a"]}"#]);
-        let got = perform_search(&backend, Some(&llm), &args).unwrap();
+        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
         assert_eq!(got.assets.len(), 1);
         assert_eq!(got.assets[0].id, "a");
         // Exactly 1 search call: per-keyword. No CLIP call.
@@ -1225,30 +1387,38 @@ mod tests {
         let mut args = default_args();
         args.query = Some("elephants".into());
         let llm = FakeLlm::new(&[r#"{"keywords":["大象"]}"#, r#"{"ids":["c","b"]}"#]);
-        let got = perform_search(&backend, Some(&llm), &args).unwrap();
+        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
         let ids: Vec<&str> = got.assets.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["b", "a", "c"]);
     }
 
     #[test]
     fn perform_search_hard_filters_apply_to_both_paths() {
+        // --place "上海浦东" resolves to a single match; both the CLIP
+        // call and the description metadata call must carry the geo.
         let backend = FakeBackend::new(vec![
             resp(vec![asset_with_desc("a", "/mnt/x/a.jpg", "x")], None),
             resp(vec![asset_with_desc("b", "/mnt/x/b.jpg", "desc")], None),
-        ]);
+        ])
+        .with_vocab(sample_vocab());
         let mut args = default_args();
         args.query = Some("x".into());
-        args.country = Some("China".into());
-        let llm = FakeLlm::new(&[r#"{"keywords":["猫"]}"#, r#"{"ids":["b"]}"#]);
-        perform_search(&backend, Some(&llm), &args).unwrap();
+        args.place = Some("上海浦东".into());
+        let llm = FakeLlm::new(&[
+            // 1. place resolution → 1 match
+            r#"{"matches":[{"country":"People's Republic of China","state":"Shanghai","city":"Pudong"}]}"#,
+            // 2. keyword expansion
+            r#"{"keywords":["猫"]}"#,
+            // 3. rerank
+            r#"{"ids":["b"]}"#,
+        ]);
+        perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
         let calls = backend.calls();
         assert_eq!(calls.len(), 2);
         for c in &calls {
-            assert_eq!(
-                c.country.as_deref(),
-                Some("China"),
-                "every backend call must carry the country filter; got {c:?}"
-            );
+            assert_eq!(c.country.as_deref(), Some("People's Republic of China"));
+            assert_eq!(c.state.as_deref(), Some("Shanghai"));
+            assert_eq!(c.city.as_deref(), Some("Pudong"));
         }
     }
 
@@ -1266,8 +1436,96 @@ mod tests {
             r#"{"keywords":["大象"]}"#,
             // rerank never called because candidates is empty
         ]);
-        let got = perform_search(&backend, Some(&llm), &args).unwrap();
+        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
         assert_eq!(got.assets.len(), 1);
         assert_eq!(got.assets[0].id, "a");
+    }
+
+    // ---- --place: resolution + multi-match merge -----------------------
+
+    #[test]
+    fn perform_search_place_requires_llm() {
+        let backend = FakeBackend::new(vec![]);
+        let mut args = default_args();
+        args.place = Some("上海".into());
+        let err = perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--place"), "got: {err}");
+        assert!(err.contains("[llm]"), "got: {err}");
+    }
+
+    #[test]
+    fn perform_search_place_with_no_query_uses_resolved_geo() {
+        // --place "中国" → country-only match; no -q means filter-only fetch.
+        let backend = FakeBackend::new(vec![resp(
+            vec![asset_with_desc("a", "/mnt/x/a.jpg", "x")],
+            None,
+        )])
+        .with_vocab(sample_vocab());
+        let mut args = default_args();
+        args.place = Some("中国".into());
+        let llm =
+            FakeLlm::new(&[r#"{"matches":[{"country":"People's Republic of China"}]}"#]);
+        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        assert_eq!(got.assets.len(), 1);
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].country.as_deref(),
+            Some("People's Republic of China")
+        );
+        assert!(calls[0].state.is_none());
+        assert!(calls[0].city.is_none());
+    }
+
+    #[test]
+    fn perform_search_place_with_no_match_bails() {
+        let backend = FakeBackend::new(vec![]).with_vocab(sample_vocab());
+        let mut args = default_args();
+        args.place = Some("Antarctica".into());
+        let llm = FakeLlm::new(&[r#"{"matches":[]}"#]);
+        let err = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no place"), "got: {err}");
+    }
+
+    #[test]
+    fn perform_search_multi_place_runs_one_fetch_each_and_rrf_merges() {
+        // Two matches → two filter-only Immich calls, results merged by RRF.
+        let backend = FakeBackend::new(vec![
+            resp(
+                vec![
+                    asset_with_desc("a", "/mnt/x/a.jpg", "x"),
+                    asset_with_desc("b", "/mnt/x/b.jpg", "x"),
+                ],
+                None,
+            ),
+            resp(
+                vec![
+                    asset_with_desc("c", "/mnt/x/c.jpg", "x"),
+                    asset_with_desc("b", "/mnt/x/b.jpg", "x"),
+                ],
+                None,
+            ),
+        ])
+        .with_vocab(sample_vocab());
+        let mut args = default_args();
+        args.place = Some("Anping".into());
+        // Pretend "Anping" matches two cities in two states.
+        let llm = FakeLlm::new(&[r#"{"matches":[
+            {"country":"People's Republic of China","state":"Shanghai","city":"Pudong"},
+            {"country":"People's Republic of China","state":"Zhejiang","city":"Andong"}
+        ]}"#]);
+        let got = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        // RRF: b appears in both lists (rank 2 in each) → top.
+        let ids: Vec<&str> = got.assets.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids[0], "b");
+        // Two Immich calls, one per match, each with its own geo.
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].city.as_deref(), Some("Pudong"));
+        assert_eq!(calls[1].city.as_deref(), Some("Andong"));
     }
 }
