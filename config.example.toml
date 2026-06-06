@@ -11,3 +11,12 @@ local  = "~/QNAP-Photos"
 
 # Optional: HTTP request timeout in seconds. Defaults to 60.
 # timeout_secs = 60
+
+# Optional: LLM endpoint used by the `ask` subcommand.
+# Any OpenAI-compatible /v1/chat/completions gateway works
+# (OneAPI, LiteLLM, Ollama's OpenAI shim, OpenAI itself, ...).
+# [llm]
+# base_url = "http://10.42.1.26:3000"
+# api_key  = "sk-..."
+# model    = "deepseek-v4-flash"
+# timeout_secs = 120

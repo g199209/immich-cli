@@ -29,6 +29,12 @@ pub struct SearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ocr: Option<String>,
 
+    /// Substring filter on the asset's description (EXIF). Available
+    /// only on `/metadata`; used by the `ask` subcommand to fan out
+    /// LLM-generated keywords against descriptions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub taken_after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,4 +95,8 @@ pub struct ExifInfo {
     pub country: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    /// Free-form text (EXIF UserComment / ImageDescription). The `ask`
+    /// command reads this for LLM-mediated semantic search.
+    #[serde(default)]
+    pub description: Option<String>,
 }

@@ -13,6 +13,28 @@ pub struct Config {
     /// Optional request timeout in seconds (default 60).
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// OpenAI-compatible LLM endpoint used by `ask`. Optional: only the
+    /// `ask` subcommand needs this; everything else ignores it.
+    #[serde(default)]
+    pub llm: Option<LlmConfig>,
+}
+
+/// LLM endpoint config. Currently expected to speak the OpenAI
+/// `/v1/chat/completions` protocol — works with OneAPI, LiteLLM, Ollama
+/// (via its OpenAI-compatible layer), OpenAI itself, and similar.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LlmConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    /// Per-call request timeout. Reranking long descriptions takes time;
+    /// default is generous on purpose.
+    #[serde(default = "default_llm_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_llm_timeout() -> u64 {
+    120
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -49,6 +71,19 @@ impl Config {
             entry.local = expand_tilde(&entry.local);
             entry.server = entry.server.trim_end_matches('/').to_string();
             entry.local = entry.local.trim_end_matches('/').to_string();
+        }
+
+        if let Some(llm) = cfg.llm.as_mut() {
+            llm.base_url = llm.base_url.trim_end_matches('/').to_string();
+            if llm.base_url.is_empty() {
+                bail!("config.llm.base_url is empty");
+            }
+            if llm.api_key.is_empty() {
+                bail!("config.llm.api_key is empty");
+            }
+            if llm.model.is_empty() {
+                bail!("config.llm.model is empty");
+            }
         }
 
         Ok(cfg)

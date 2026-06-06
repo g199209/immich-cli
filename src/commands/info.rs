@@ -543,6 +543,7 @@ mod tests {
                 local: "/home/u/Photos".into(),
             }],
             timeout_secs: 60,
+            llm: None,
         }
     }
 

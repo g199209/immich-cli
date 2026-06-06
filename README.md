@@ -108,3 +108,36 @@ The JSON format is the full `/api/assets/{id}` body plus three
 top-level fields we add: `localPath` (resolved NFS path), `albums`
 (membership list), and `ocr` (text regions). Nothing is dropped, so
 it's safe to query for anything Immich exposes.
+
+### `ask`
+
+`ask` does **natural-language semantic search over photo descriptions**,
+mediated by an LLM. The CLI itself stays stateless — there is no local
+vector store. Each query runs three stages:
+
+1. **Keyword expansion**: the LLM extracts up to 16 substring keywords
+   (including synonyms and lexical variants) from the natural-language
+   query.
+2. **Substring search**: each keyword is fanned out against Immich's
+   metadata `description` filter; the union (deduped by asset id) forms
+   the candidate set (capped at 100).
+3. **Rerank**: the LLM is shown the query and candidate descriptions and
+   returns the relevant ids in order.
+
+```bash
+# Add an [llm] section to config.toml first (see config.example.toml).
+immich-cli ask "我想看看非洲草原上的一大群大象聚集在一起的照片"
+immich-cli ask "sunset over the ocean with sailing boats" --format table
+```
+
+Requires the `[llm]` section in `config.toml`. Without it `ask` errors
+out — there is intentionally no fallback so the user knows the feature
+is unavailable.
+
+`ask` only matches against the `exifInfo.description` field. If your
+assets have no descriptions yet, every query will report "no description
+matched any keyword" — populate descriptions via your own pipeline first
+(e.g., a vision-language-model captioning step writing back to the file
+EXIF or sidecar). Immich's external libraries are read-only via the API
+(PUT to `/api/assets/{id}` returns 403 for description), so descriptions
+have to be written to disk and re-indexed.

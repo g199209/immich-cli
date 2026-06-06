@@ -207,6 +207,7 @@ fn fetch_assets_inner<B: SearchBackend>(
             state: state.clone(),
             country: country.clone(),
             ocr: ocr.clone(),
+            description: None,
             taken_after: taken_after.clone(),
             taken_before: taken_before.clone(),
             asset_type: args.r#type.map(|t| t.as_api_str().to_string()),
@@ -463,6 +464,7 @@ mod tests {
                 country: Some("China".into()),
                 latitude: Some(31.0),
                 longitude: Some(121.0),
+                description: None,
             }),
         }
     }
