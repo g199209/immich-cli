@@ -27,12 +27,12 @@ filters freely.
 | `--place "..."` | Free-form natural-language place. Chinese, English, mixed, abbreviations all work. Resolved by LLM against the library's actual geocoded vocabulary, so you can be vague (`"中国"` → all of China), state-level (`"上海"` → all of Shanghai), or precise (`"上海浦东"` → just Pudong). Multiple matches (e.g. a city name spanning provinces) are queried in parallel and merged. |
 | `--ocr "text"` | Substring match against text Immich's OCR detected in the image. Case-sensitive, Unicode-aware. |
 | `--type image\|video` | Restrict to one asset type. |
-| `--limit N` | Cap results (default 1000). |
+| `--limit N` | Cap results. Defaults to 36 for `-q` searches (max 64), and 1000 for filter-only searches. |
 | `--format paths\|json\|table` | Output. Default `paths`. |
 
 ### Picking the right query mode
 
-- User describes what's **visible** ("穿红裙子的小女孩", "雪山", "生日蛋糕") → plain `-q`. CLIP + description fusion gives the best recall.
+- User describes what's **visible** ("穿红裙子的小女孩", "雪山", "生日蛋糕") → plain `-q`. CLIP + description candidates are deduped and reranked together.
 - User describes a **scene, event, or feeling** that is more verbal than visual ("外婆在厨房包饺子", "搬家那天") → also `-q`, but consider adding `--description-only` if CLIP results look noisy. Descriptions tend to capture context, CLIP captures appearance.
 - User gives a **constraint** (date range, place, OCR text, image vs. video) → use the appropriate filter alone, or combine with `-q`.
 - Never pass `-q ""` or whitespace-only — it's rejected.
@@ -122,8 +122,9 @@ right away. Common patterns:
 - **Date filters use `localDateTime`** (the wall-clock time at the place
   the photo was taken), not UTC. `--taken-after 2023-12-31` is correct
   for "after the end of 2023 in the user's local timezone".
-- **`--limit` is the total cap across all pages.** The CLI walks Immich
-  pagination internally; you do not need to loop.
+- **`--limit` is the total cap across all pages.** With `-q`, the default
+  is 36 and the maximum is 64. Without `-q`, the default is 1000 and the
+  CLI walks Immich pagination internally; you do not need to loop.
 - **Some assets may be `UNMAPPED` or `MISSING`** if the path mapping is
   incomplete or the file was moved on disk. These are reported on stderr
   by default and silently dropped from stdout; pass `--include-unmapped`

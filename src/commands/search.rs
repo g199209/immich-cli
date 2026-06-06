@@ -1,24 +1,28 @@
-use crate::client::{ImmichClient, PlacesBackend, SearchBackend};
+use crate::client::{ImmichClient, InfoBackend, PlacesBackend, SearchBackend};
 use crate::config::{Config, PathMapEntry};
-use crate::description_search::{self, HardFilters};
+use crate::description_search::{self, HardFilters, RerankCandidate, RerankLocation};
 use crate::llm::{ChatBackend, OpenAiClient};
 use crate::models::{Asset, SearchRequest};
 use crate::path_map;
 use crate::places::{self, Admin2Lookup, PlaceMatch};
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+const DEFAULT_FILTER_LIMIT: u32 = 1000;
+const DEFAULT_QUERY_LIMIT: u32 = 36;
+const MAX_QUERY_LIMIT: u32 = 64;
 
 #[derive(Args, Debug)]
 pub struct SearchArgs {
-    /// Natural-language query. By default it drives two parallel ranked
-    /// searches that are merged with Reciprocal Rank Fusion: (1) Immich
-    /// smart search (CLIP image-similarity), and (2) LLM-mediated
-    /// description search (keyword expansion + substring match against
-    /// `exifInfo.description` + LLM rerank).
+    /// Natural-language query. With `[llm]` configured, the CLI collects
+    /// candidates from Immich smart search (CLIP image similarity) plus
+    /// LLM-expanded description keyword searches, dedupes them, enriches
+    /// them with metadata, then asks the LLM to return the top results.
     ///
     /// With `--description-only`, the CLIP path is skipped. If no
-    /// `[llm]` block is configured, the description path is skipped.
+    /// `[llm]` block is configured, it gracefully degrades to smart search only.
     #[arg(short, long)]
     pub query: Option<String>,
 
@@ -39,8 +43,7 @@ pub struct SearchArgs {
     /// Free-form natural-language place ("上海", "Shanghai Pudong",
     /// "中国 内蒙古", "Japan"). Resolved against the library's actual
     /// geocoded vocabulary via the LLM, then turned into one or more
-    /// exact-match city/state/country queries against Immich, merged by
-    /// Reciprocal Rank Fusion if more than one entry matches. Requires
+    /// exact-match city/state/country queries against Immich. Requires
     /// `[llm]` in config.
     #[arg(long)]
     pub place: Option<String>,
@@ -55,10 +58,10 @@ pub struct SearchArgs {
     #[arg(long, value_enum)]
     pub r#type: Option<AssetTypeArg>,
 
-    /// Maximum results to return across all pages. When the server has more
-    /// matches than this, the output ends with a `......` marker.
-    #[arg(long, default_value_t = 1000)]
-    pub limit: u32,
+    /// Maximum results to return. Defaults to 36 for -q searches and 1000
+    /// for filter-only searches. With -q, the maximum accepted value is 64.
+    #[arg(long)]
+    pub limit: Option<u32>,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Paths)]
@@ -133,7 +136,7 @@ impl SearchArgs {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.limit == 0 {
+        if self.limit == Some(0) {
             bail!("--limit must be > 0");
         }
         if !self.has_filter() {
@@ -142,7 +145,20 @@ impl SearchArgs {
                  --taken-before, --place, --ocr, or --type"
             );
         }
+        if non_blank(&self.query) && self.effective_limit() > MAX_QUERY_LIMIT {
+            bail!("--limit cannot exceed {MAX_QUERY_LIMIT} when -q/--query is set");
+        }
         Ok(())
+    }
+
+    pub fn effective_limit(&self) -> u32 {
+        self.limit.unwrap_or_else(|| {
+            if non_blank(&self.query) {
+                DEFAULT_QUERY_LIMIT
+            } else {
+                DEFAULT_FILTER_LIMIT
+            }
+        })
     }
 }
 
@@ -179,6 +195,7 @@ pub fn run(cfg: &Config, args: SearchArgs) -> Result<()> {
         cfg,
         &client,
         &client,
+        &client,
         llm.as_ref(),
         &lookup,
         &args,
@@ -192,6 +209,7 @@ pub fn run_with<S, P, L, W>(
     cfg: &Config,
     search_be: &S,
     places_be: &P,
+    info_be: &impl InfoBackend,
     llm: Option<&L>,
     admin2_lookup: &Admin2Lookup,
     args: &SearchArgs,
@@ -203,17 +221,19 @@ where
     L: ChatBackend,
     W: std::io::Write,
 {
-    let result = perform_search(search_be, places_be, llm, admin2_lookup, args)?;
+    let result = perform_search(cfg, search_be, places_be, info_be, llm, admin2_lookup, args)?;
     emit_to_writer(&cfg.path_map, args, &result, out)
 }
 
 /// Top-level dispatcher: resolve `--place` (if set) to one or more
-/// concrete (city, state, country) tuples, run the CLIP+description
-/// flow once per tuple, then RRF-merge across tuples. With no `--place`,
-/// the flow runs exactly once with no geo filter.
+/// concrete (city, state, country) tuples. Query searches build one
+/// global candidate pool and ask the LLM to rerank it; filter-only
+/// searches run one metadata fetch per place and merge those lists.
 fn perform_search<S, P, L>(
+    cfg: &Config,
     search_be: &S,
     places_be: &P,
+    info_be: &impl InfoBackend,
     llm: Option<&L>,
     admin2_lookup: &Admin2Lookup,
     args: &SearchArgs,
@@ -224,9 +244,22 @@ where
     L: ChatBackend,
 {
     let places = resolve_places(places_be, llm, admin2_lookup, args)?;
+    let query = cleaned(&args.query);
+    if let Some(q) = query.as_deref() {
+        return perform_query_search(
+            cfg,
+            search_be,
+            info_be,
+            llm,
+            admin2_lookup,
+            args,
+            &places,
+            q,
+        );
+    }
 
     if places.len() == 1 {
-        let r = perform_search_for_place(search_be, llm, args, &places[0])?;
+        let r = fetch_assets(search_be, args, &places[0])?;
         if args.verbose {
             eprintln!(
                 "[verbose] search: returned {} asset(s){}",
@@ -241,7 +274,7 @@ where
     let mut per_place: Vec<Vec<Asset>> = Vec::with_capacity(places.len());
     let mut any_truncated = false;
     for (i, p) in places.iter().enumerate() {
-        let r = perform_search_for_place(search_be, llm, args, p)?;
+        let r = fetch_assets(search_be, args, p)?;
         if args.verbose {
             eprintln!(
                 "[verbose] search: place[{}] (country={:?} state={:?} city={:?}) returned {} asset(s){}",
@@ -257,7 +290,7 @@ where
         per_place.push(r.assets);
     }
     let merged = description_search::rrf_merge(&per_place);
-    let limit = args.limit as usize;
+    let limit = args.effective_limit() as usize;
     let truncated = any_truncated || merged.len() > limit;
     let assets: Vec<Asset> = merged.into_iter().take(limit).collect();
     if args.verbose {
@@ -308,58 +341,285 @@ where
     Ok(matches)
 }
 
-/// Run the CLIP + description flow for one resolved place. This is the
-/// previous `perform_search` body, plus a `PlaceMatch` parameter that
-/// supplies the city/state/country filters.
-fn perform_search_for_place<S, L>(
+fn perform_query_search<S, L>(
+    cfg: &Config,
     search_be: &S,
+    info_be: &impl InfoBackend,
     llm: Option<&L>,
+    admin2_lookup: &Admin2Lookup,
     args: &SearchArgs,
-    place: &PlaceMatch,
+    places: &[PlaceMatch],
+    query: &str,
 ) -> Result<FetchResult>
 where
     S: SearchBackend,
     L: ChatBackend,
 {
-    let query = cleaned(&args.query);
-
-    // No -q at all: filter-only, no LLM in play.
-    let Some(q) = query.as_deref() else {
-        return fetch_assets(search_be, args, place);
-    };
-
-    // -q is set. Description-only means LLM is mandatory.
-    if args.description_only {
-        let llm = llm.ok_or_else(|| {
-            anyhow::anyhow!(
+    let limit = args.effective_limit() as usize;
+    let Some(llm) = llm else {
+        if args.description_only {
+            bail!(
                 "--description-only requires an [llm] section in config.toml \
                  (base_url, api_key, model)"
-            )
-        })?;
-        let filters = build_hard_filters(args, place)?;
-        let assets = description_search::run(search_be, llm, q, &filters)?;
+            );
+        }
+        return collect_smart_only(search_be, args, places);
+    };
+
+    let keywords = description_search::expand_keywords(llm, query)?;
+    let mut candidates: HashMap<String, QueryCandidate> = HashMap::new();
+    let mut order = Vec::new();
+    let mut any_truncated = false;
+
+    for place in places {
+        if !args.description_only {
+            let smart = fetch_assets(search_be, args, place)?;
+            any_truncated |= smart.truncated;
+            for asset in smart.assets {
+                add_smart_candidate(&mut candidates, &mut order, asset);
+            }
+        }
+
+        if !keywords.is_empty() {
+            let filters = build_hard_filters(args, place)?;
+            let hits = description_search::collect_keyword_hits(
+                search_be,
+                &keywords,
+                &filters,
+                args.effective_limit(),
+            )?;
+            for hit in hits {
+                add_keyword_candidate(&mut candidates, &mut order, hit.asset, hit.keyword);
+            }
+        }
+    }
+
+    if candidates.is_empty() {
         return Ok(FetchResult {
-            assets,
+            assets: vec![],
             truncated: false,
         });
     }
 
-    // -q is set, both paths allowed. Run CLIP. If LLM is configured,
-    // also run description and merge.
-    let clip = fetch_assets(search_be, args, place)?;
-    let Some(llm) = llm else {
-        return Ok(clip);
-    };
-    let filters = build_hard_filters(args, place)?;
-    let description = description_search::run(search_be, llm, q, &filters)?;
-    if description.is_empty() {
-        return Ok(clip);
+    let enriched = build_rerank_candidates(cfg, info_be, admin2_lookup, &candidates, &order)?;
+    let prompt_candidates: Vec<RerankCandidate> =
+        enriched.iter().map(|c| c.prompt.clone()).collect();
+    let selected_ids = description_search::rerank_rich(llm, query, limit, &prompt_candidates)?;
+    let mut by_short_id: HashMap<&str, &RichQueryCandidate> = HashMap::new();
+    for c in &enriched {
+        by_short_id.insert(c.prompt.id.as_str(), c);
     }
-    let merged = description_search::rrf_merge(&[clip.assets, description]);
-    let limit = args.limit as usize;
-    let truncated = merged.len() > limit;
-    let assets = merged.into_iter().take(limit).collect();
+    let mut seen = HashSet::new();
+    let mut assets = Vec::new();
+    for id in selected_ids {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(candidate) = by_short_id.get(id.as_str()) {
+            assets.push(candidate.asset.clone());
+        }
+        if assets.len() >= limit {
+            break;
+        }
+    }
+
+    let truncated = any_truncated || (assets.len() >= limit && enriched.len() > limit);
     Ok(FetchResult { assets, truncated })
+}
+
+fn collect_smart_only<S: SearchBackend>(
+    search_be: &S,
+    args: &SearchArgs,
+    places: &[PlaceMatch],
+) -> Result<FetchResult> {
+    let limit = args.effective_limit() as usize;
+    let mut by_id: HashMap<String, Asset> = HashMap::new();
+    let mut order = Vec::new();
+    let mut any_truncated = false;
+    for place in places {
+        let r = fetch_assets(search_be, args, place)?;
+        any_truncated |= r.truncated;
+        for asset in r.assets {
+            if !by_id.contains_key(&asset.id) {
+                order.push(asset.id.clone());
+                by_id.insert(asset.id.clone(), asset);
+            }
+        }
+    }
+    let mut assets = Vec::new();
+    for id in order {
+        if let Some(asset) = by_id.remove(&id) {
+            assets.push(asset);
+        }
+        if assets.len() >= limit {
+            break;
+        }
+    }
+    let truncated = any_truncated || by_id.len() + assets.len() > limit;
+    Ok(FetchResult { assets, truncated })
+}
+
+#[derive(Debug, Clone)]
+struct QueryCandidate {
+    asset: Asset,
+    smart: bool,
+    matched_keywords: Vec<String>,
+}
+
+fn add_smart_candidate(
+    candidates: &mut HashMap<String, QueryCandidate>,
+    order: &mut Vec<String>,
+    asset: Asset,
+) {
+    let id = asset.id.clone();
+    if let Some(existing) = candidates.get_mut(&id) {
+        existing.smart = true;
+        return;
+    }
+    order.push(id.clone());
+    candidates.insert(
+        id,
+        QueryCandidate {
+            asset,
+            smart: true,
+            matched_keywords: Vec::new(),
+        },
+    );
+}
+
+fn add_keyword_candidate(
+    candidates: &mut HashMap<String, QueryCandidate>,
+    order: &mut Vec<String>,
+    asset: Asset,
+    keyword: String,
+) {
+    let id = asset.id.clone();
+    if let Some(existing) = candidates.get_mut(&id) {
+        if !existing.matched_keywords.contains(&keyword) {
+            existing.matched_keywords.push(keyword);
+        }
+        return;
+    }
+    order.push(id.clone());
+    candidates.insert(
+        id,
+        QueryCandidate {
+            asset,
+            smart: false,
+            matched_keywords: vec![keyword],
+        },
+    );
+}
+
+#[derive(Debug, Clone)]
+struct RichQueryCandidate {
+    prompt: RerankCandidate,
+    asset: Asset,
+}
+
+fn build_rerank_candidates(
+    cfg: &Config,
+    info_be: &impl InfoBackend,
+    admin2_lookup: &Admin2Lookup,
+    candidates: &HashMap<String, QueryCandidate>,
+    order: &[String],
+) -> Result<Vec<RichQueryCandidate>> {
+    let mut out = Vec::with_capacity(order.len());
+    for (i, id) in order.iter().enumerate() {
+        let Some(candidate) = candidates.get(id) else {
+            continue;
+        };
+        let people = configured_people_for_asset(info_be, &cfg.people, &candidate.asset.id)?;
+        let mut sources = Vec::new();
+        if candidate.smart {
+            sources.push("smart".to_string());
+        }
+        if !candidate.matched_keywords.is_empty() {
+            sources.push("description".to_string());
+        }
+        let description = candidate
+            .asset
+            .exif_info
+            .as_ref()
+            .and_then(|e| e.description.clone())
+            .unwrap_or_default();
+        out.push(RichQueryCandidate {
+            prompt: RerankCandidate {
+                id: format!("c{:03}", i + 1),
+                asset_type: candidate.asset.asset_type.clone(),
+                taken_at: candidate.asset.local_date_time.clone(),
+                location: rerank_location(&candidate.asset, admin2_lookup),
+                people,
+                sources,
+                matched_keywords: candidate.matched_keywords.clone(),
+                description,
+            },
+            asset: candidate.asset.clone(),
+        });
+    }
+    Ok(out)
+}
+
+fn configured_people_for_asset(
+    info_be: &impl InfoBackend,
+    people_map: &std::collections::BTreeMap<String, Vec<String>>,
+    asset_id: &str,
+) -> Result<Vec<String>> {
+    if people_map.is_empty() {
+        return Ok(Vec::new());
+    }
+    let full_asset = info_be
+        .get_asset(asset_id)
+        .with_context(|| format!("failed to fetch full asset detail for {asset_id}"))?;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let Some(items) = full_asset.get("people").and_then(|v| v.as_array()) else {
+        return Ok(out);
+    };
+    for person in items {
+        let Some(name) = person
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(roles) = people_map.get(name) else {
+            continue;
+        };
+        if !seen.insert(name.to_string()) {
+            continue;
+        }
+        if roles.is_empty() {
+            out.push(name.to_string());
+        } else {
+            out.push(format!("{}（{}）", name, roles.join("/")));
+        }
+    }
+    Ok(out)
+}
+
+fn rerank_location(asset: &Asset, admin2_lookup: &Admin2Lookup) -> Option<RerankLocation> {
+    let exif = asset.exif_info.as_ref()?;
+    let country = cleaned(&exif.country);
+    let state = cleaned(&exif.state);
+    let city = cleaned(&exif.city);
+    if country.is_none() && state.is_none() && city.is_none() {
+        return None;
+    }
+    let admin2 = match (&country, &state, &city) {
+        (Some(country), Some(state), Some(city)) => admin2_lookup
+            .get(&(country.clone(), state.clone(), city.clone()))
+            .cloned(),
+        _ => None,
+    };
+    Some(RerankLocation {
+        country,
+        state,
+        admin2,
+        city,
+    })
 }
 
 /// Build the hard-filter bundle the description path needs. Geo fields
@@ -422,9 +682,10 @@ fn fetch_assets_inner<B: SearchBackend>(
     let query = cleaned(&args.query);
     let ocr = cleaned(&args.ocr);
 
-    let mut collected: Vec<Asset> = Vec::with_capacity(args.limit as usize);
+    let limit = args.effective_limit();
+    let mut collected: Vec<Asset> = Vec::with_capacity(limit as usize);
     let mut page: u32 = 1;
-    let page_size = page_size.min(args.limit).max(1);
+    let page_size = page_size.min(limit).max(1);
 
     loop {
         let req = SearchRequest {
@@ -447,14 +708,14 @@ fn fetch_assets_inner<B: SearchBackend>(
         let count = resp.assets.items.len();
         let has_more = resp.assets.next_page.as_ref().is_some_and(|v| !v.is_null());
 
-        let remaining = (args.limit as usize).saturating_sub(collected.len());
+        let remaining = (limit as usize).saturating_sub(collected.len());
         let take = count.min(remaining);
         // Anything not consumed in the current page, plus a known next page,
         // both mean there's more we're not fetching.
         let leftover_in_page = count > take;
         collected.extend(resp.assets.items.into_iter().take(take));
 
-        if collected.len() as u32 >= args.limit {
+        if collected.len() as u32 >= limit {
             return Ok(FetchResult {
                 assets: collected,
                 truncated: leftover_in_page || has_more,
@@ -706,12 +967,23 @@ mod tests {
             place: None,
             ocr: None,
             r#type: None,
-            limit: 1000,
+            limit: None,
             format: OutputFormat::Paths,
             verify: false,
             include_missing: false,
             include_unmapped: false,
             verbose: false,
+        }
+    }
+
+    fn cfg() -> Config {
+        Config {
+            server_url: "http://x".into(),
+            api_key: "k".into(),
+            path_map: pmap(),
+            timeout_secs: 60,
+            llm: None,
+            people: std::collections::BTreeMap::new(),
         }
     }
 
@@ -774,6 +1046,25 @@ mod tests {
         }
     }
 
+    impl InfoBackend for FakeBackend {
+        fn get_asset(&self, _id: &str) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({
+                "people": [
+                    { "name": "测试人物甲" },
+                    { "name": "未配置测试人物" }
+                ]
+            }))
+        }
+
+        fn albums_for_asset(&self, _id: &str) -> Result<serde_json::Value> {
+            Ok(serde_json::json!([]))
+        }
+
+        fn ocr_for_asset(&self, _id: &str) -> Result<serde_json::Value> {
+            Ok(serde_json::json!([]))
+        }
+    }
+
     fn resp(items: Vec<Asset>, next: Option<&str>) -> SearchResponse {
         let total = items.len() as u32;
         SearchResponse {
@@ -827,8 +1118,30 @@ mod tests {
     fn validate_rejects_zero_limit() {
         let mut args = default_args();
         args.query = Some("x".into());
-        args.limit = 0;
+        args.limit = Some(0);
         assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn effective_limit_depends_on_query_mode() {
+        let mut args = default_args();
+        args.taken_after = Some("2025-01-01".into());
+        assert_eq!(args.effective_limit(), 1000);
+
+        args.query = Some("x".into());
+        assert_eq!(args.effective_limit(), 36);
+
+        args.limit = Some(64);
+        assert!(args.validate().is_ok());
+
+        args.limit = Some(65);
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("cannot exceed 64"), "got: {err}");
+
+        args.query = None;
+        args.limit = Some(5000);
+        assert!(args.validate().is_ok());
+        assert_eq!(args.effective_limit(), 5000);
     }
 
     #[test]
@@ -928,7 +1241,7 @@ mod tests {
         ]);
         let mut args = default_args();
         args.query = Some("anything".into());
-        args.limit = 10;
+        args.limit = Some(10);
 
         // page_size is hard-coded in fetch_assets, so drive the inner
         // entry point directly to exercise multi-page behavior.
@@ -957,7 +1270,7 @@ mod tests {
         )]);
         let mut args = default_args();
         args.query = Some("x".into());
-        args.limit = 2;
+        args.limit = Some(2);
 
         let got = fetch_assets_inner(&backend, &args, 10, &no_place()).unwrap();
         assert_eq!(got.assets.len(), 2);
@@ -980,7 +1293,7 @@ mod tests {
         )]);
         let mut args = default_args();
         args.query = Some("x".into());
-        args.limit = 2;
+        args.limit = Some(2);
         let got = fetch_assets_inner(&backend, &args, 2, &no_place()).unwrap();
         assert_eq!(got.assets.len(), 2);
         assert!(got.truncated);
@@ -1000,7 +1313,7 @@ mod tests {
         )]);
         let mut args = default_args();
         args.query = Some("x".into());
-        args.limit = 2;
+        args.limit = Some(2);
         let got = fetch_assets_inner(&backend, &args, 2, &no_place()).unwrap();
         assert_eq!(got.assets.len(), 2);
         assert!(!got.truncated);
@@ -1267,16 +1580,22 @@ mod tests {
 
     struct FakeLlm {
         replies: RefCell<Vec<String>>,
+        messages: RefCell<Vec<Vec<crate::llm::Message>>>,
     }
     impl FakeLlm {
         fn new(replies: &[&str]) -> Self {
             Self {
                 replies: RefCell::new(replies.iter().map(|s| s.to_string()).collect()),
+                messages: RefCell::new(Vec::new()),
             }
+        }
+        fn messages(&self) -> Vec<Vec<crate::llm::Message>> {
+            self.messages.borrow().clone()
         }
     }
     impl crate::llm::ChatBackend for FakeLlm {
-        fn chat_json(&self, _messages: &[crate::llm::Message]) -> Result<String> {
+        fn chat_json(&self, messages: &[crate::llm::Message]) -> Result<String> {
+            self.messages.borrow_mut().push(messages.to_vec());
             Ok(self.replies.borrow_mut().remove(0))
         }
     }
@@ -1316,8 +1635,16 @@ mod tests {
         args.taken_after = Some("2025-01-01".into());
         // LLM provided but should NOT be used (no -q, no --place).
         let llm = FakeLlm::new(&[]);
-        let got =
-            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let got = perform_search(
+            &cfg(),
+            &backend,
+            &backend,
+            &backend,
+            Some(&llm),
+            &Admin2Lookup::new(),
+            &args,
+        )
+        .unwrap();
         assert_eq!(got.assets.len(), 1);
         // Only the CLIP/metadata path call, never the description workflow.
         assert_eq!(backend.calls().len(), 1);
@@ -1331,9 +1658,16 @@ mod tests {
         )]);
         let mut args = default_args();
         args.query = Some("elephants".into());
-        let got =
-            perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args)
-                .unwrap();
+        let got = perform_search::<_, _, FakeLlm>(
+            &cfg(),
+            &backend,
+            &backend,
+            &backend,
+            None,
+            &Admin2Lookup::new(),
+            &args,
+        )
+        .unwrap();
         assert_eq!(got.assets.len(), 1);
         assert_eq!(backend.calls().len(), 1);
         // The single call was to /smart (query is set).
@@ -1346,10 +1680,17 @@ mod tests {
         let mut args = default_args();
         args.query = Some("elephants".into());
         args.description_only = true;
-        let err =
-            perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args)
-                .unwrap_err()
-                .to_string();
+        let err = perform_search::<_, _, FakeLlm>(
+            &cfg(),
+            &backend,
+            &backend,
+            &backend,
+            None,
+            &Admin2Lookup::new(),
+            &args,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("[llm]"), "got: {err}");
     }
 
@@ -1362,9 +1703,17 @@ mod tests {
         let mut args = default_args();
         args.query = Some("elephants".into());
         args.description_only = true;
-        let llm = FakeLlm::new(&[r#"{"keywords":["大象"]}"#, r#"{"ids":["a"]}"#]);
-        let got =
-            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let llm = FakeLlm::new(&[r#"{"keywords":["大象"]}"#, r#"{"ids":["c001"]}"#]);
+        let got = perform_search(
+            &cfg(),
+            &backend,
+            &backend,
+            &backend,
+            Some(&llm),
+            &Admin2Lookup::new(),
+            &args,
+        )
+        .unwrap();
         assert_eq!(got.assets.len(), 1);
         assert_eq!(got.assets[0].id, "a");
         // Exactly 1 search call: per-keyword. No CLIP call.
@@ -1375,10 +1724,10 @@ mod tests {
     }
 
     #[test]
-    fn perform_search_combined_merges_clip_and_description_with_rrf() {
+    fn perform_search_combined_uses_single_llm_rerank_over_deduped_candidates() {
         // CLIP returns: [a, b] (in that rank order)
-        // Description workflow returns: [c, b]   (LLM-reranked)
-        // RRF should put `b` first (appears in both), then `a`, then `c`.
+        // Keyword search returns: [c, b]. Candidate order is a=c001,
+        // b=c002, c=c003; b carries both smart + description evidence.
         let backend = FakeBackend::new(vec![
             // First call: CLIP smart search (query is set)
             resp(
@@ -1399,11 +1748,71 @@ mod tests {
         ]);
         let mut args = default_args();
         args.query = Some("elephants".into());
-        let llm = FakeLlm::new(&[r#"{"keywords":["大象"]}"#, r#"{"ids":["c","b"]}"#]);
-        let got =
-            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let llm = FakeLlm::new(&[r#"{"keywords":["大象"]}"#, r#"{"ids":["c003","c002"]}"#]);
+        let got = perform_search(
+            &cfg(),
+            &backend,
+            &backend,
+            &backend,
+            Some(&llm),
+            &Admin2Lookup::new(),
+            &args,
+        )
+        .unwrap();
         let ids: Vec<&str> = got.assets.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, vec!["b", "a", "c"]);
+        assert_eq!(ids, vec!["c", "b"]);
+    }
+
+    #[test]
+    fn perform_search_rerank_prompt_includes_metadata_people_and_evidence_without_paths() {
+        let backend = FakeBackend::new(vec![
+            resp(
+                vec![asset_with_desc("a", "/mnt/x/a.jpg", "smart-desc")],
+                None,
+            ),
+            resp(
+                vec![asset_with_desc("a", "/mnt/x/a.jpg", "keyword-desc")],
+                None,
+            ),
+        ]);
+        let mut cfg = cfg();
+        cfg.people
+            .insert("测试人物甲".into(), vec!["女儿".into(), "孩子".into()]);
+        let mut lookup = Admin2Lookup::new();
+        lookup.insert(
+            ("China".into(), "Shanghai".into(), "Shanghai".into()),
+            "Shanghai Shi".into(),
+        );
+        let mut args = default_args();
+        args.query = Some("孩子".into());
+        let llm = FakeLlm::new(&[r#"{"keywords":["孩子"]}"#, r#"{"ids":["c001"]}"#]);
+
+        let got = perform_search(
+            &cfg,
+            &backend,
+            &backend,
+            &backend,
+            Some(&llm),
+            &lookup,
+            &args,
+        )
+        .unwrap();
+        assert_eq!(got.assets[0].id, "a");
+
+        let messages = llm.messages();
+        assert_eq!(messages.len(), 2);
+        let rerank_user = &messages[1][1].content;
+        assert!(rerank_user.contains("\"id\":\"c001\""), "{rerank_user}");
+        assert!(rerank_user.contains("\"takenAt\""), "{rerank_user}");
+        assert!(rerank_user.contains("Shanghai Shi"), "{rerank_user}");
+        assert!(
+            rerank_user.contains("测试人物甲（女儿/孩子）"),
+            "{rerank_user}"
+        );
+        assert!(rerank_user.contains("\"smart\""), "{rerank_user}");
+        assert!(rerank_user.contains("\"description\""), "{rerank_user}");
+        assert!(rerank_user.contains("\"孩子\""), "{rerank_user}");
+        assert!(!rerank_user.contains("/mnt/x/a.jpg"), "{rerank_user}");
     }
 
     #[test]
@@ -1424,9 +1833,18 @@ mod tests {
             // 2. keyword expansion
             r#"{"keywords":["猫"]}"#,
             // 3. rerank
-            r#"{"ids":["b"]}"#,
+            r#"{"ids":["c002"]}"#,
         ]);
-        perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        perform_search(
+            &cfg(),
+            &backend,
+            &backend,
+            &backend,
+            Some(&llm),
+            &Admin2Lookup::new(),
+            &args,
+        )
+        .unwrap();
         let calls = backend.calls();
         assert_eq!(calls.len(), 2);
         for c in &calls {
@@ -1437,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn perform_search_combined_falls_back_to_clip_when_description_empty() {
+    fn perform_search_combined_reranks_smart_hits_when_description_empty() {
         let backend = FakeBackend::new(vec![
             // CLIP returns 1 hit
             resp(vec![asset_with_desc("a", "/mnt/x/a.jpg", "x")], None),
@@ -1446,12 +1864,17 @@ mod tests {
         ]);
         let mut args = default_args();
         args.query = Some("elephants".into());
-        let llm = FakeLlm::new(&[
-            r#"{"keywords":["大象"]}"#,
-            // rerank never called because candidates is empty
-        ]);
-        let got =
-            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let llm = FakeLlm::new(&[r#"{"keywords":["大象"]}"#, r#"{"ids":["c001"]}"#]);
+        let got = perform_search(
+            &cfg(),
+            &backend,
+            &backend,
+            &backend,
+            Some(&llm),
+            &Admin2Lookup::new(),
+            &args,
+        )
+        .unwrap();
         assert_eq!(got.assets.len(), 1);
         assert_eq!(got.assets[0].id, "a");
     }
@@ -1463,10 +1886,17 @@ mod tests {
         let backend = FakeBackend::new(vec![]);
         let mut args = default_args();
         args.place = Some("上海".into());
-        let err =
-            perform_search::<_, _, FakeLlm>(&backend, &backend, None, &Admin2Lookup::new(), &args)
-                .unwrap_err()
-                .to_string();
+        let err = perform_search::<_, _, FakeLlm>(
+            &cfg(),
+            &backend,
+            &backend,
+            &backend,
+            None,
+            &Admin2Lookup::new(),
+            &args,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("--place"), "got: {err}");
         assert!(err.contains("[llm]"), "got: {err}");
     }
@@ -1482,8 +1912,16 @@ mod tests {
         let mut args = default_args();
         args.place = Some("中国".into());
         let llm = FakeLlm::new(&[r#"{"matches":[{"country":"People's Republic of China"}]}"#]);
-        let got =
-            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let got = perform_search(
+            &cfg(),
+            &backend,
+            &backend,
+            &backend,
+            Some(&llm),
+            &Admin2Lookup::new(),
+            &args,
+        )
+        .unwrap();
         assert_eq!(got.assets.len(), 1);
         let calls = backend.calls();
         assert_eq!(calls.len(), 1);
@@ -1501,9 +1939,17 @@ mod tests {
         let mut args = default_args();
         args.place = Some("Antarctica".into());
         let llm = FakeLlm::new(&[r#"{"matches":[]}"#]);
-        let err = perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args)
-            .unwrap_err()
-            .to_string();
+        let err = perform_search(
+            &cfg(),
+            &backend,
+            &backend,
+            &backend,
+            Some(&llm),
+            &Admin2Lookup::new(),
+            &args,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("no place"), "got: {err}");
     }
 
@@ -1534,8 +1980,16 @@ mod tests {
             {"country":"People's Republic of China","state":"Shanghai","city":"Pudong"},
             {"country":"People's Republic of China","state":"Zhejiang","city":"Andong"}
         ]}"#]);
-        let got =
-            perform_search(&backend, &backend, Some(&llm), &Admin2Lookup::new(), &args).unwrap();
+        let got = perform_search(
+            &cfg(),
+            &backend,
+            &backend,
+            &backend,
+            Some(&llm),
+            &Admin2Lookup::new(),
+            &args,
+        )
+        .unwrap();
         // RRF: b appears in both lists (rank 2 in each) → top.
         let ids: Vec<&str> = got.assets.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids[0], "b");

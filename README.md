@@ -39,10 +39,10 @@ or with only empty/whitespace flag values — is rejected to avoid
 accidentally listing the entire library.
 
 ```bash
-# Natural-language query. With [llm] configured, this fires off BOTH
-# Immich's CLIP smart search AND an LLM-mediated semantic search over
-# photo descriptions; the two ranked lists are merged with Reciprocal
-# Rank Fusion (RRF). Without [llm], it gracefully degrades to CLIP only.
+# Natural-language query. With [llm] configured, this collects candidates
+# from Immich CLIP smart search plus LLM-expanded description keyword
+# searches, then asks the LLM to rerank the combined candidate pool.
+# Without [llm], it gracefully degrades to CLIP only.
 immich-cli search -q "孩子戴生日帽" --limit 20
 
 # Skip the CLIP path entirely; description-only semantic search.
@@ -83,8 +83,10 @@ Output formats:
 - `json` — newline-delimited JSON, one object per asset.
 - `table` — aligned `TYPE / TAKEN / LOCATION / PATH`.
 
-The CLI walks Immich's pagination internally; `--limit` is the overall cap
-(default 1000). Per-request page size is hard-coded to the API maximum.
+The CLI walks Immich's pagination internally; `--limit` is the overall cap.
+For `-q` searches it defaults to 36 and cannot exceed 64. For filter-only
+searches it defaults to 1000 and has no CLI-enforced upper bound. Per-request
+page size is hard-coded to the API maximum for filter-only searches.
 When the server has more matches than `--limit` allowed through, the
 output ends with a `......` marker (or `{"truncated":true}` in
 `--format json`, so NDJSON stays parseable).

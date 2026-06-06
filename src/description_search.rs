@@ -1,19 +1,18 @@
 //! LLM-mediated semantic search over photo descriptions.
 //!
 //! Used by `search` when an `-q` query is paired with a configured
-//! `[llm]` block. Three stages, no local state:
+//! `[llm]` block. Main responsibilities:
 //!   1. **Keyword expansion**: LLM turns the natural-language query into
-//!      up to 16 Chinese substrings that are likely to appear verbatim
+//!      up to 8 Chinese substrings that are likely to appear verbatim
 //!      inside a photo description.
 //!   2. **Substring search**: each keyword is fanned out against
 //!      `/api/search/metadata` with the same hard filters the user
-//!      passed to `search` (city, country, taken-after, …). Candidates
-//!      are unioned and deduped by asset id, capped at 100.
-//!   3. **Rerank**: the LLM is shown the query and candidate
-//!      descriptions and returns the relevant ids in relevance order.
-//!
-//! The output is a `Vec<Asset>` in LLM-assessed relevance order,
-//! suitable for merging with another ranked list via RRF.
+//!      passed to `search` (city, country, taken-after, …). Each keyword
+//!      contributes up to 64 candidates, then all candidates are unioned
+//!      and deduped by asset id.
+//!   3. **Rerank**: the LLM is shown the query and enriched candidates
+//!      (short id, metadata, sources, matched keywords, description) and
+//!      returns the relevant short ids in relevance order.
 
 use crate::client::SearchBackend;
 use crate::llm::{ChatBackend, Message};
@@ -24,15 +23,15 @@ use std::collections::HashMap;
 
 /// Hard upper bound on keywords returned by the LLM. Keeps prompt cost
 /// linear and the substring-search fan-out bounded.
-pub const MAX_KEYWORDS: usize = 16;
+pub const MAX_KEYWORDS: usize = 8;
 
-/// Hard upper bound on candidates fed into the rerank prompt. 100 long
-/// descriptions × 1500 chars each ≈ 50 KB ≈ 25 K tokens, which fits in
-/// every modern context window with room for reasoning overhead.
-pub const MAX_CANDIDATES: usize = 100;
+/// Per-keyword cap before deduping candidates for rerank. Keeping this
+/// per keyword avoids one broad keyword filling the entire rerank pool
+/// and starving later, more specific keywords.
+pub const MAX_CANDIDATES_PER_KEYWORD: usize = 64;
 
 /// Per-candidate description excerpt sent to the reranker. Long enough
-/// to convey content, short enough that 100 candidates stays bounded.
+/// to convey content, short enough to keep the rerank prompt bounded.
 pub const DESCRIPTION_EXCERPT_CHARS: usize = 1500;
 
 /// Same hard filters `search` accepts; we forward them to both the CLIP
@@ -66,7 +65,7 @@ Chinese before extracting keywords, regardless of the query language.\n\n\
 Your output MUST be a single JSON object of the form: \
 {\"keywords\": [\"...\", \"...\"]}\n\n\
 Rules:\n\
-- Up to 16 keywords. Quality > quantity.\n\
+- Up to 8 keywords. Quality > quantity.\n\
 - Output keywords in Chinese (e.g. sunset → 夕阳/日落, elephant → 大象, \
 sailing boat → 帆船, savannah → 草原).\n\
 - Each keyword is a short noun phrase (1-8 Chinese characters) likely to \
@@ -106,9 +105,36 @@ pub fn collect_candidates<S: SearchBackend>(
     keywords: &[String],
     filters: &HardFilters,
 ) -> Result<Vec<Asset>> {
+    let hits = collect_keyword_hits(search, keywords, filters, MAX_CANDIDATES_PER_KEYWORD as u32)?;
     let mut by_id: HashMap<String, Asset> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
+    for hit in hits {
+        if !by_id.contains_key(&hit.asset.id) {
+            order.push(hit.asset.id.clone());
+            by_id.insert(hit.asset.id.clone(), hit.asset);
+        }
+    }
 
+    Ok(order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect())
+}
+
+#[derive(Debug, Clone)]
+pub struct KeywordHit {
+    pub keyword: String,
+    pub asset: Asset,
+}
+
+pub fn collect_keyword_hits<S: SearchBackend>(
+    search: &S,
+    keywords: &[String],
+    filters: &HardFilters,
+    per_keyword_limit: u32,
+) -> Result<Vec<KeywordHit>> {
+    let mut hits = Vec::new();
+    let per_keyword_limit = per_keyword_limit.max(1);
     for kw in keywords {
         let req = SearchRequest {
             description: Some(kw.clone()),
@@ -119,29 +145,24 @@ pub fn collect_candidates<S: SearchBackend>(
             taken_before: filters.taken_before.clone(),
             asset_type: filters.asset_type.clone(),
             ocr: filters.ocr.clone(),
-            size: Some(250),
+            size: Some(per_keyword_limit),
             with_exif: Some(true),
             ..Default::default()
         };
         let resp = search.search(&req)?;
-        for asset in resp.assets.items {
-            if !by_id.contains_key(&asset.id) {
-                order.push(asset.id.clone());
-                by_id.insert(asset.id.clone(), asset);
-            }
-            if by_id.len() >= MAX_CANDIDATES {
-                break;
-            }
-        }
-        if by_id.len() >= MAX_CANDIDATES {
-            break;
+        for asset in resp
+            .assets
+            .items
+            .into_iter()
+            .take(per_keyword_limit as usize)
+        {
+            hits.push(KeywordHit {
+                keyword: kw.clone(),
+                asset,
+            });
         }
     }
-
-    Ok(order
-        .into_iter()
-        .filter_map(|id| by_id.remove(&id))
-        .collect())
+    Ok(hits)
 }
 
 // ---- stage 3: rerank -----------------------------------------------------
@@ -153,15 +174,79 @@ struct RerankReply {
 }
 
 const RERANK_SYSTEM_PROMPT: &str = "\
-You are filtering image-search candidates. Given a user query and a list of \
-candidate photos (each with an id and a free-form description), identify the \
-candidates that genuinely match the user's intent.\n\n\
+You are ranking image-search candidates. Given a user query and a list of \
+candidate photos, identify the candidates that genuinely match the user's \
+intent and order them by relevance.\n\n\
 Your output MUST be a single JSON object: {\"ids\": [\"id1\", \"id2\", ...]} \
 ordered by descending relevance.\n\n\
 Rules:\n\
 - Be strict. Omit weak or tangential matches.\n\
-- Only include ids you actually saw in the input.\n\
+- Only include candidate ids you actually saw in the input.\n\
+- Return no more ids than the requested limit.\n\
 - If nothing matches, return {\"ids\": []}.";
+
+#[derive(Debug, Clone)]
+pub struct RerankCandidate {
+    pub id: String,
+    pub asset_type: String,
+    pub taken_at: Option<String>,
+    pub location: Option<RerankLocation>,
+    pub people: Vec<String>,
+    pub sources: Vec<String>,
+    pub matched_keywords: Vec<String>,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RerankLocation {
+    pub country: Option<String>,
+    pub state: Option<String>,
+    pub admin2: Option<String>,
+    pub city: Option<String>,
+}
+
+pub fn rerank_rich<L: ChatBackend>(
+    llm: &L,
+    query: &str,
+    limit: usize,
+    candidates: &[RerankCandidate],
+) -> Result<Vec<String>> {
+    let items: Vec<serde_json::Value> = candidates
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id,
+                "type": c.asset_type,
+                "takenAt": c.taken_at,
+                "location": c.location.as_ref().map(|loc| serde_json::json!({
+                    "country": loc.country,
+                    "state": loc.state,
+                    "admin2": loc.admin2,
+                    "city": loc.city,
+                })),
+                "people": c.people,
+                "sources": c.sources,
+                "matchedKeywords": c.matched_keywords,
+                "description": excerpt(&c.description, DESCRIPTION_EXCERPT_CHARS),
+            })
+        })
+        .collect();
+    let user_msg = serde_json::json!({
+        "query": query,
+        "limit": limit,
+        "candidates": items,
+    });
+    let messages = [
+        Message::system(RERANK_SYSTEM_PROMPT),
+        Message::user(user_msg.to_string()),
+    ];
+    let raw = llm.chat_json(&messages)?;
+    let reply: RerankReply = serde_json::from_str(&raw)
+        .with_context(|| format!("LLM rerank reply was not valid JSON: {raw}"))?;
+    let mut ids = reply.ids;
+    ids.truncate(limit);
+    Ok(ids)
+}
 
 pub fn rerank<L: ChatBackend>(llm: &L, query: &str, candidates: &[Asset]) -> Result<Vec<String>> {
     let items: Vec<serde_json::Value> = candidates
@@ -390,9 +475,40 @@ mod tests {
         for c in calls.iter() {
             assert_eq!(c.country.as_deref(), Some("China"));
             assert_eq!(c.asset_type.as_deref(), Some("IMAGE"));
+            assert_eq!(c.size, Some(MAX_CANDIDATES_PER_KEYWORD as u32));
         }
         assert_eq!(calls[0].description.as_deref(), Some("大象"));
         assert_eq!(calls[1].description.as_deref(), Some("草原"));
+    }
+
+    #[test]
+    fn collect_candidates_caps_each_keyword_without_starving_later_keywords() {
+        let broad: Vec<Asset> = (0..70)
+            .map(|i| asset(&format!("broad-{i}"), &format!("/x/broad-{i}.jpg")))
+            .collect();
+        let search = FakeSearch::new(vec![
+            bucket(broad),
+            bucket(vec![asset("exact", "/x/e.jpg")]),
+        ]);
+
+        let got = collect_candidates(
+            &search,
+            &["宽泛".into(), "精确".into()],
+            &HardFilters::default(),
+        )
+        .unwrap();
+
+        let calls = search.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].description.as_deref(), Some("宽泛"));
+        assert_eq!(calls[1].description.as_deref(), Some("精确"));
+
+        let ids: Vec<&str> = got.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids.len(), MAX_CANDIDATES_PER_KEYWORD + 1);
+        assert!(ids.contains(&"broad-0"));
+        assert!(ids.contains(&"broad-63"));
+        assert!(!ids.contains(&"broad-64"));
+        assert!(ids.contains(&"exact"));
     }
 
     #[test]

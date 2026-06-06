@@ -11,7 +11,7 @@
 //! country) tuple), hand it to an LLM as an indented outline, and ask it
 //! to map the user's input to one or more concrete entries. The
 //! resulting [`PlaceMatch`]es are passed back to the search command,
-//! which issues one Immich request per match and RRF-merges them.
+//! which combines the matching Immich requests according to search mode.
 
 use crate::client::PlacesBackend;
 use crate::llm::{ChatBackend, Message};
