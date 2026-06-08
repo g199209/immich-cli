@@ -81,6 +81,12 @@ pub struct SearchArgs {
     #[arg(long)]
     pub include_unmapped: bool,
 
+    /// Include archived assets. By default the search hides archived assets
+    /// (matching Immich's web timeline default) by sending `isArchived=false`
+    /// to every search call.
+    #[arg(long)]
+    pub include_archived: bool,
+
     /// Print a detailed trace of what the CLI did to stderr: vocabulary
     /// size, full LLM prompt + raw reply, parsed matches, and per-place
     /// Immich call counts. Useful when `--place` resolution is surprising.
@@ -366,35 +372,84 @@ where
         return collect_smart_only(search_be, args, places);
     };
 
-    let keywords = description_search::expand_keywords(llm, query)?;
+    if args.verbose {
+        eprintln!(
+            "[verbose] search: query={query:?} description_only={} places={} limit={limit}",
+            args.description_only,
+            places.len()
+        );
+    }
+    let keywords = description_search::expand_keywords(llm, query, args.verbose)?;
     let mut candidates: HashMap<String, QueryCandidate> = HashMap::new();
     let mut order = Vec::new();
     let mut any_truncated = false;
 
-    for place in places {
+    for (pi, place) in places.iter().enumerate() {
         if !args.description_only {
             let smart = fetch_assets(search_be, args, place)?;
             any_truncated |= smart.truncated;
+            if args.verbose {
+                eprintln!(
+                    "[verbose] search: place[{pi}] CLIP smart search → {} asset(s){}",
+                    smart.assets.len(),
+                    if smart.truncated { " (truncated)" } else { "" }
+                );
+            }
             for asset in smart.assets {
                 add_smart_candidate(&mut candidates, &mut order, asset);
             }
         }
 
         if !keywords.is_empty() {
+            if args.verbose {
+                eprintln!(
+                    "[verbose] search: place[{pi}] description-keyword fan-out \
+                     ({} keyword(s), per-keyword limit = {})",
+                    keywords.len(),
+                    args.effective_limit()
+                );
+            }
             let filters = build_hard_filters(args, place)?;
             let hits = description_search::collect_keyword_hits(
                 search_be,
                 &keywords,
                 &filters,
                 args.effective_limit(),
+                args.verbose,
             )?;
+            if args.verbose {
+                eprintln!(
+                    "[verbose] search: place[{pi}] description-keyword total → {} hit(s)",
+                    hits.len()
+                );
+            }
             for hit in hits {
                 add_keyword_candidate(&mut candidates, &mut order, hit.asset, hit.keyword);
             }
         }
     }
 
+    if args.verbose {
+        let (mut smart_only, mut desc_only, mut both) = (0usize, 0usize, 0usize);
+        for c in candidates.values() {
+            match (c.smart, !c.matched_keywords.is_empty()) {
+                (true, true) => both += 1,
+                (true, false) => smart_only += 1,
+                (false, true) => desc_only += 1,
+                (false, false) => {}
+            }
+        }
+        eprintln!(
+            "[verbose] search: candidate pool → {} unique \
+             (smart-only={smart_only}, description-only={desc_only}, both={both})",
+            candidates.len()
+        );
+    }
+
     if candidates.is_empty() {
+        if args.verbose {
+            eprintln!("[verbose] search: candidate pool empty, skipping rerank");
+        }
         return Ok(FetchResult {
             assets: vec![],
             truncated: false,
@@ -404,7 +459,8 @@ where
     let enriched = build_rerank_candidates(cfg, info_be, admin2_lookup, &candidates, &order)?;
     let prompt_candidates: Vec<RerankCandidate> =
         enriched.iter().map(|c| c.prompt.clone()).collect();
-    let selected_ids = description_search::rerank_rich(llm, query, limit, &prompt_candidates)?;
+    let selected_ids =
+        description_search::rerank_rich(llm, query, limit, &prompt_candidates, args.verbose)?;
     let mut by_short_id: HashMap<&str, &RichQueryCandidate> = HashMap::new();
     for c in &enriched {
         by_short_id.insert(c.prompt.id.as_str(), c);
@@ -424,6 +480,13 @@ where
     }
 
     let truncated = any_truncated || (assets.len() >= limit && enriched.len() > limit);
+    if args.verbose {
+        eprintln!(
+            "[verbose] search: returning {} asset(s){}",
+            assets.len(),
+            if truncated { " (truncated)" } else { "" }
+        );
+    }
     Ok(FetchResult { assets, truncated })
 }
 
@@ -433,12 +496,25 @@ fn collect_smart_only<S: SearchBackend>(
     places: &[PlaceMatch],
 ) -> Result<FetchResult> {
     let limit = args.effective_limit() as usize;
+    if args.verbose {
+        eprintln!(
+            "[verbose] search: smart-only path (no [llm] configured) over {} place(s), limit={limit}",
+            places.len()
+        );
+    }
     let mut by_id: HashMap<String, Asset> = HashMap::new();
     let mut order = Vec::new();
     let mut any_truncated = false;
-    for place in places {
+    for (pi, place) in places.iter().enumerate() {
         let r = fetch_assets(search_be, args, place)?;
         any_truncated |= r.truncated;
+        if args.verbose {
+            eprintln!(
+                "[verbose] search: place[{pi}] CLIP smart search → {} asset(s){}",
+                r.assets.len(),
+                if r.truncated { " (truncated)" } else { "" }
+            );
+        }
         for asset in r.assets {
             if !by_id.contains_key(&asset.id) {
                 order.push(asset.id.clone());
@@ -456,6 +532,13 @@ fn collect_smart_only<S: SearchBackend>(
         }
     }
     let truncated = any_truncated || by_id.len() + assets.len() > limit;
+    if args.verbose {
+        eprintln!(
+            "[verbose] search: returning {} asset(s){}",
+            assets.len(),
+            if truncated { " (truncated)" } else { "" }
+        );
+    }
     Ok(FetchResult { assets, truncated })
 }
 
@@ -641,6 +724,7 @@ fn build_hard_filters(args: &SearchArgs, place: &PlaceMatch) -> Result<HardFilte
             .map(normalize_date_end)
             .transpose()?,
         asset_type: args.r#type.map(|t| t.as_api_str().to_string()),
+        is_archived: if args.include_archived { None } else { Some(false) },
     })
 }
 
@@ -699,6 +783,7 @@ fn fetch_assets_inner<B: SearchBackend>(
             taken_after: taken_after.clone(),
             taken_before: taken_before.clone(),
             asset_type: args.r#type.map(|t| t.as_api_str().to_string()),
+            is_archived: if args.include_archived { None } else { Some(false) },
             page: Some(page),
             size: Some(page_size),
             with_exif: Some(true),
@@ -972,6 +1057,7 @@ mod tests {
             verify: false,
             include_missing: false,
             include_unmapped: false,
+            include_archived: false,
             verbose: false,
         }
     }

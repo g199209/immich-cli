@@ -43,6 +43,13 @@ pub struct SearchRequest {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub asset_type: Option<String>,
 
+    /// Tri-state archive filter. `Some(false)` excludes archived assets
+    /// (matches the Immich web timeline default); `Some(true)` returns
+    /// only archived; `None` includes both. Default behavior of the
+    /// Immich API when omitted is "include both".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_archived: Option<bool>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

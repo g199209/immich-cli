@@ -46,6 +46,9 @@ pub struct HardFilters {
     pub taken_before: Option<String>,
     pub asset_type: Option<String>,
     pub ocr: Option<String>,
+    /// See [`crate::models::SearchRequest::is_archived`] for semantics.
+    /// `None` means "don't filter" (Immich returns archived + non-archived).
+    pub is_archived: Option<bool>,
 }
 
 // ---- stage 1: keyword expansion ------------------------------------------
@@ -80,12 +83,26 @@ only if both are plausibly used in Chinese descriptions.\n\
 - Do NOT include function words, abstract verbs, or generic words like \
 \"照片\", \"图片\", \"看看\", \"想\".";
 
-pub fn expand_keywords<L: ChatBackend>(llm: &L, query: &str) -> Result<Vec<String>> {
+pub fn expand_keywords<L: ChatBackend>(
+    llm: &L,
+    query: &str,
+    verbose: bool,
+) -> Result<Vec<String>> {
+    if verbose {
+        eprintln!(
+            "[verbose] description_search: expanding keywords for query={query:?} \
+             (system prompt = {} chars)",
+            KEYWORD_SYSTEM_PROMPT.len()
+        );
+    }
     let messages = [
         Message::system(KEYWORD_SYSTEM_PROMPT),
         Message::user(query.to_string()),
     ];
     let raw = llm.chat_json(&messages)?;
+    if verbose {
+        eprintln!("[verbose] description_search: keyword raw LLM reply = {raw}");
+    }
     let reply: KeywordsReply = serde_json::from_str(&raw)
         .with_context(|| format!("LLM keyword reply was not valid JSON: {raw}"))?;
     let mut keywords: Vec<String> = reply
@@ -95,7 +112,18 @@ pub fn expand_keywords<L: ChatBackend>(llm: &L, query: &str) -> Result<Vec<Strin
         .filter(|k| !k.is_empty())
         .collect();
     keywords.truncate(MAX_KEYWORDS);
-    Ok(dedup_preserving_order(keywords))
+    let out = dedup_preserving_order(keywords);
+    if verbose {
+        eprintln!(
+            "[verbose] description_search: parsed {} keyword(s): [{}]",
+            out.len(),
+            out.iter()
+                .map(|k| format!("{k:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(out)
 }
 
 // ---- stage 2: substring search per keyword (with hard filters) ----------
@@ -105,7 +133,13 @@ pub fn collect_candidates<S: SearchBackend>(
     keywords: &[String],
     filters: &HardFilters,
 ) -> Result<Vec<Asset>> {
-    let hits = collect_keyword_hits(search, keywords, filters, MAX_CANDIDATES_PER_KEYWORD as u32)?;
+    let hits = collect_keyword_hits(
+        search,
+        keywords,
+        filters,
+        MAX_CANDIDATES_PER_KEYWORD as u32,
+        false,
+    )?;
     let mut by_id: HashMap<String, Asset> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for hit in hits {
@@ -132,10 +166,11 @@ pub fn collect_keyword_hits<S: SearchBackend>(
     keywords: &[String],
     filters: &HardFilters,
     per_keyword_limit: u32,
+    verbose: bool,
 ) -> Result<Vec<KeywordHit>> {
     let mut hits = Vec::new();
     let per_keyword_limit = per_keyword_limit.max(1);
-    for kw in keywords {
+    for (i, kw) in keywords.iter().enumerate() {
         let req = SearchRequest {
             description: Some(kw.clone()),
             city: filters.city.clone(),
@@ -145,21 +180,28 @@ pub fn collect_keyword_hits<S: SearchBackend>(
             taken_before: filters.taken_before.clone(),
             asset_type: filters.asset_type.clone(),
             ocr: filters.ocr.clone(),
+            is_archived: filters.is_archived,
             size: Some(per_keyword_limit),
             with_exif: Some(true),
             ..Default::default()
         };
         let resp = search.search(&req)?;
-        for asset in resp
-            .assets
-            .items
-            .into_iter()
-            .take(per_keyword_limit as usize)
-        {
+        let returned = resp.assets.items.len();
+        let take = returned.min(per_keyword_limit as usize);
+        for asset in resp.assets.items.into_iter().take(take) {
             hits.push(KeywordHit {
                 keyword: kw.clone(),
                 asset,
             });
+        }
+        if verbose {
+            let capped = if returned > take { " (capped)" } else { "" };
+            eprintln!(
+                "[verbose] description_search: keyword {}/{} {kw:?} → {take} hit(s) \
+                 (cap {per_keyword_limit}){capped}",
+                i + 1,
+                keywords.len()
+            );
         }
     }
     Ok(hits)
@@ -210,6 +252,7 @@ pub fn rerank_rich<L: ChatBackend>(
     query: &str,
     limit: usize,
     candidates: &[RerankCandidate],
+    verbose: bool,
 ) -> Result<Vec<String>> {
     let items: Vec<serde_json::Value> = candidates
         .iter()
@@ -236,15 +279,37 @@ pub fn rerank_rich<L: ChatBackend>(
         "limit": limit,
         "candidates": items,
     });
+    let user_payload = user_msg.to_string();
+    if verbose {
+        eprintln!(
+            "[verbose] description_search: rerank query={query:?} limit={limit} \
+             candidates={} (user payload = {} chars)",
+            candidates.len(),
+            user_payload.len()
+        );
+    }
     let messages = [
         Message::system(RERANK_SYSTEM_PROMPT),
-        Message::user(user_msg.to_string()),
+        Message::user(user_payload),
     ];
     let raw = llm.chat_json(&messages)?;
+    if verbose {
+        eprintln!("[verbose] description_search: rerank raw LLM reply = {raw}");
+    }
     let reply: RerankReply = serde_json::from_str(&raw)
         .with_context(|| format!("LLM rerank reply was not valid JSON: {raw}"))?;
     let mut ids = reply.ids;
     ids.truncate(limit);
+    if verbose {
+        eprintln!(
+            "[verbose] description_search: rerank kept {} id(s) after limit: [{}]",
+            ids.len(),
+            ids.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok(ids)
 }
 
@@ -329,7 +394,7 @@ where
     S: SearchBackend,
     L: ChatBackend,
 {
-    let keywords = expand_keywords(llm, query)?;
+    let keywords = expand_keywords(llm, query, false)?;
     if keywords.is_empty() {
         return Ok(vec![]);
     }
