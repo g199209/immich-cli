@@ -43,12 +43,14 @@ pub struct SearchRequest {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub asset_type: Option<String>,
 
-    /// Tri-state archive filter. `Some(false)` excludes archived assets
-    /// (matches the Immich web timeline default); `Some(true)` returns
-    /// only archived; `None` includes both. Default behavior of the
-    /// Immich API when omitted is "include both".
+    /// Visibility scope. Immich ≥ v2.7.5 replaced the old tri-state
+    /// `isArchived` flag with a single-valued `visibility` field; you
+    /// can only target one bucket per request. Known values: `"timeline"`
+    /// (non-archived, the web default), `"archive"`, `"hidden"`, `"locked"`.
+    /// `None` falls back to the server default (`timeline`), so archived
+    /// assets are excluded unless `"archive"` is sent explicitly.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_archived: Option<bool>,
+    pub visibility: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page: Option<u32>,

@@ -46,9 +46,10 @@ pub struct HardFilters {
     pub taken_before: Option<String>,
     pub asset_type: Option<String>,
     pub ocr: Option<String>,
-    /// See [`crate::models::SearchRequest::is_archived`] for semantics.
-    /// `None` means "don't filter" (Immich returns archived + non-archived).
-    pub is_archived: Option<bool>,
+    /// See [`crate::models::SearchRequest::visibility`] for semantics.
+    /// `None` falls back to the server default (`timeline`, i.e.
+    /// non-archived). Send `"archive"` to target archived assets.
+    pub visibility: Option<String>,
 }
 
 // ---- stage 1: keyword expansion ------------------------------------------
@@ -180,7 +181,7 @@ pub fn collect_keyword_hits<S: SearchBackend>(
             taken_before: filters.taken_before.clone(),
             asset_type: filters.asset_type.clone(),
             ocr: filters.ocr.clone(),
-            is_archived: filters.is_archived,
+            visibility: filters.visibility.clone(),
             size: Some(per_keyword_limit),
             with_exif: Some(true),
             ..Default::default()

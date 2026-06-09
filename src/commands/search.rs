@@ -81,9 +81,12 @@ pub struct SearchArgs {
     #[arg(long)]
     pub include_unmapped: bool,
 
-    /// Include archived assets. By default the search hides archived assets
-    /// (matching Immich's web timeline default) by sending `isArchived=false`
-    /// to every search call.
+    /// Search the archive bucket instead of the timeline. By default the
+    /// CLI lets the server fall back to its timeline default, so archived
+    /// assets are hidden. Setting this sends `visibility=archive`, which
+    /// returns ONLY archived assets — Immich ≥ v2.7.5 no longer supports a
+    /// single request spanning both buckets, so "include" is a slight
+    /// misnomer kept for CLI backwards compatibility.
     #[arg(long)]
     pub include_archived: bool,
 
@@ -724,7 +727,11 @@ fn build_hard_filters(args: &SearchArgs, place: &PlaceMatch) -> Result<HardFilte
             .map(normalize_date_end)
             .transpose()?,
         asset_type: args.r#type.map(|t| t.as_api_str().to_string()),
-        is_archived: if args.include_archived { None } else { Some(false) },
+        visibility: if args.include_archived {
+            Some("archive".to_string())
+        } else {
+            None
+        },
     })
 }
 
@@ -783,7 +790,11 @@ fn fetch_assets_inner<B: SearchBackend>(
             taken_after: taken_after.clone(),
             taken_before: taken_before.clone(),
             asset_type: args.r#type.map(|t| t.as_api_str().to_string()),
-            is_archived: if args.include_archived { None } else { Some(false) },
+            visibility: if args.include_archived {
+                Some("archive".to_string())
+            } else {
+                None
+            },
             page: Some(page),
             size: Some(page_size),
             with_exif: Some(true),
