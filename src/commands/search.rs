@@ -1,8 +1,8 @@
-use crate::client::{ImmichClient, InfoBackend, PlacesBackend, SearchBackend};
+use crate::client::{ImmichClient, InfoBackend, PlacesBackend, SearchBackend, StacksBackend};
 use crate::config::{Config, PathMapEntry};
 use crate::description_search::{self, HardFilters, RerankCandidate, RerankLocation};
 use crate::llm::{ChatBackend, OpenAiClient};
-use crate::models::{Asset, SearchRequest};
+use crate::models::{Asset, SearchRequest, SearchResponse, Stack};
 use crate::path_map;
 use crate::places::{self, Admin2Lookup, PlaceMatch};
 use anyhow::{bail, Context, Result};
@@ -89,6 +89,14 @@ pub struct SearchArgs {
     /// misnomer kept for CLI backwards compatibility.
     #[arg(long)]
     pub include_archived: bool,
+
+    /// Include assets that are non-primary members of a stack. By default the
+    /// CLI fetches /api/stacks and hides stacked members from results
+    /// (mirroring how Immich's web timeline collapses a stack to its cover),
+    /// so stacking redundant shots is a non-destructive way to keep them out
+    /// of search. Pass this to disable that filtering and return every match.
+    #[arg(long)]
+    pub include_stacked: bool,
 
     /// Print a detailed trace of what the CLI did to stderr: vocabulary
     /// size, full LLM prompt + raw reply, parsed matches, and per-place
@@ -190,6 +198,48 @@ fn cleaned(opt: &Option<String>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Collect the ids of every *non-primary* stack member. These are the shots
+/// Immich's web timeline tucks behind a stack cover; the search command drops
+/// them so stacked duplicates stop surfacing. The primary (cover) asset of
+/// each stack is deliberately kept so the group still has one representative.
+fn hidden_stacked_ids(stacks: &[Stack]) -> HashSet<String> {
+    let mut hidden = HashSet::new();
+    for stack in stacks {
+        for member in &stack.assets {
+            if member.id != stack.primary_asset_id {
+                hidden.insert(member.id.clone());
+            }
+        }
+    }
+    hidden
+}
+
+/// Wraps a [`SearchBackend`] and strips stacked non-primary assets from every
+/// response. Both the CLIP fetch and the description keyword fan-out funnel
+/// through `SearchBackend::search`, so wrapping the backend filters every
+/// search path in one place. The hidden set is pre-computed from `/api/stacks`
+/// because the search endpoints never report stack membership themselves.
+struct StackFilteredBackend<'a, S: SearchBackend> {
+    inner: &'a S,
+    hidden: HashSet<String>,
+}
+
+impl<'a, S: SearchBackend> StackFilteredBackend<'a, S> {
+    fn new(inner: &'a S, hidden: HashSet<String>) -> Self {
+        Self { inner, hidden }
+    }
+}
+
+impl<S: SearchBackend> SearchBackend for StackFilteredBackend<'_, S> {
+    fn search(&self, req: &SearchRequest) -> Result<SearchResponse> {
+        let mut resp = self.inner.search(req)?;
+        if !self.hidden.is_empty() {
+            resp.assets.items.retain(|a| !self.hidden.contains(&a.id));
+        }
+        Ok(resp)
+    }
+}
+
 pub fn run(cfg: &Config, args: SearchArgs) -> Result<()> {
     args.validate()?;
     let client = ImmichClient::new(cfg)?;
@@ -198,11 +248,42 @@ pub fn run(cfg: &Config, args: SearchArgs) -> Result<()> {
         Some(p) => places::load_admin2_lookup(&p)?,
         None => Admin2Lookup::new(),
     };
+
+    // Stacking is the user's lever for keeping near-duplicate shots out of
+    // search: hide every non-primary stack member unless asked to keep them.
+    // Failure here is non-fatal — degrade to an unfiltered search with a warning
+    // rather than blocking the whole query on the stacks endpoint.
+    let hidden = if args.include_stacked {
+        HashSet::new()
+    } else {
+        match client.stacks() {
+            Ok(stacks) => {
+                let hidden = hidden_stacked_ids(&stacks);
+                if args.verbose {
+                    eprintln!(
+                        "[verbose] search: {} stack(s) → hiding {} non-primary asset(s)",
+                        stacks.len(),
+                        hidden.len()
+                    );
+                }
+                hidden
+            }
+            Err(e) => {
+                eprintln!(
+                    "warn: could not fetch /api/stacks ({e:#}); \
+                     results may include stacked duplicates"
+                );
+                HashSet::new()
+            }
+        }
+    };
+    let search_be = StackFilteredBackend::new(&client, hidden);
+
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     run_with(
         cfg,
-        &client,
+        &search_be,
         &client,
         &client,
         llm.as_ref(),
@@ -1069,6 +1150,7 @@ mod tests {
             include_missing: false,
             include_unmapped: false,
             include_archived: false,
+            include_stacked: false,
             verbose: false,
         }
     }
@@ -1473,6 +1555,86 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("immich exploded"), "got: {err}");
+    }
+
+    // ---- stack filtering -----------------------------------------------
+
+    fn stack_member(id: &str) -> crate::models::StackMember {
+        crate::models::StackMember { id: id.into() }
+    }
+
+    #[test]
+    fn hidden_stacked_ids_keeps_primary_drops_rest() {
+        let stacks = vec![
+            Stack {
+                primary_asset_id: "p1".into(),
+                assets: vec![stack_member("p1"), stack_member("c1"), stack_member("c2")],
+            },
+            Stack {
+                primary_asset_id: "p2".into(),
+                assets: vec![stack_member("p2"), stack_member("c3")],
+            },
+        ];
+        let hidden = hidden_stacked_ids(&stacks);
+        assert_eq!(hidden.len(), 3);
+        for child in ["c1", "c2", "c3"] {
+            assert!(hidden.contains(child), "expected {child} hidden");
+        }
+        // Covers — the assets we keep — must never be hidden.
+        assert!(!hidden.contains("p1"));
+        assert!(!hidden.contains("p2"));
+    }
+
+    #[test]
+    fn stack_filter_drops_hidden_assets_across_pages() {
+        // Page 1: cover p1, stacked child c1, unrelated x. Page 2: stacked
+        // child c2, unrelated y. The cover and the non-stacked assets survive;
+        // the stacked children are filtered out, and pagination keeps walking
+        // so the limit fills with real results.
+        let backend = FakeBackend::new(vec![
+            resp(
+                vec![
+                    make_asset("p1", "/mnt/x/p1.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
+                    make_asset("c1", "/mnt/x/c1.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
+                    make_asset("x", "/mnt/x/x.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
+                ],
+                Some("2"),
+            ),
+            resp(
+                vec![
+                    make_asset("c2", "/mnt/x/c2.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
+                    make_asset("y", "/mnt/x/y.jpg", "IMAGE", "2025-01-01T00:00:00Z"),
+                ],
+                None,
+            ),
+        ]);
+        let hidden: HashSet<String> = ["c1".to_string(), "c2".to_string()].into_iter().collect();
+        let filtered = StackFilteredBackend::new(&backend, hidden);
+        let mut args = default_args();
+        args.query = Some("x".into());
+        args.limit = Some(10);
+        let got = fetch_assets_inner(&filtered, &args, 3, &no_place()).unwrap();
+        let ids: Vec<&str> = got.assets.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["p1", "x", "y"]);
+    }
+
+    #[test]
+    fn stack_filter_with_empty_set_is_passthrough() {
+        let backend = FakeBackend::new(vec![resp(
+            vec![make_asset(
+                "a1",
+                "/mnt/x/a.jpg",
+                "IMAGE",
+                "2025-01-01T00:00:00Z",
+            )],
+            None,
+        )]);
+        let filtered = StackFilteredBackend::new(&backend, HashSet::new());
+        let mut args = default_args();
+        args.query = Some("x".into());
+        let got = fetch_assets(&filtered, &args, &no_place()).unwrap();
+        assert_eq!(got.assets.len(), 1);
+        assert_eq!(got.assets[0].id, "a1");
     }
 
     // ---- emit_to_writer ------------------------------------------------

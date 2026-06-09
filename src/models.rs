@@ -114,3 +114,25 @@ pub struct ExifInfo {
     #[serde(default)]
     pub description: Option<String>,
 }
+
+/// One stack from `GET /api/stacks`. A stack groups several assets under a
+/// single cover (`primaryAssetId`); the other members are the shots Immich's
+/// web timeline tucks behind that cover. The search/metadata endpoints never
+/// report an asset's stack membership, so listing stacks is the only way to
+/// learn which assets are stacked duplicates.
+///
+/// The API returns each member as a full asset object; we only need the id,
+/// so members decode into the minimal [`StackMember`]. Unlisted fields (`id`,
+/// timestamps, …) are ignored by serde.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Stack {
+    pub primary_asset_id: String,
+    #[serde(default)]
+    pub assets: Vec<StackMember>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct StackMember {
+    pub id: String,
+}

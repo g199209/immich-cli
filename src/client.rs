@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::models::{SearchRequest, SearchResponse};
+use crate::models::{SearchRequest, SearchResponse, Stack};
 use crate::places::CityVocabEntry;
 use anyhow::{anyhow, bail, Context, Result};
 use std::time::Duration;
@@ -32,6 +32,17 @@ pub trait CaptionBackend {
 /// about, without us having to walk the whole asset table.
 pub trait PlacesBackend {
     fn cities_vocabulary(&self) -> Result<Vec<CityVocabEntry>>;
+}
+
+/// Backend exposing the user's stacks. A stack groups several assets under
+/// one cover (`primaryAssetId`); the non-primary members are exactly what
+/// Immich's web timeline hides. The `search` command fetches these once and
+/// drops stacked members from its results, since the search endpoints never
+/// populate an asset's stack field themselves.
+pub trait StacksBackend {
+    /// `GET /api/stacks` — every stack owned by the caller, each with its
+    /// primary (cover) asset id and member assets.
+    fn stacks(&self) -> Result<Vec<Stack>>;
 }
 
 /// Backend the `info` subcommand talks to. Separate from `SearchBackend`
@@ -155,6 +166,13 @@ impl InfoBackend for ImmichClient {
 
     fn ocr_for_asset(&self, id: &str) -> Result<serde_json::Value> {
         self.get_json(&format!("/api/assets/{id}/ocr"))
+    }
+}
+
+impl StacksBackend for ImmichClient {
+    fn stacks(&self) -> Result<Vec<Stack>> {
+        let raw = self.get_json("/api/stacks")?;
+        serde_json::from_value(raw).context("failed to decode /api/stacks response")
     }
 }
 
