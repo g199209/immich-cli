@@ -877,12 +877,8 @@ mod tests {
             local_date_time: None,
             checksum: checksum.into(),
             exif_info: Some(ExifInfo {
-                city: None,
-                state: None,
-                country: None,
-                latitude: None,
-                longitude: None,
                 description: description.map(String::from),
+                ..Default::default()
             }),
         }
     }

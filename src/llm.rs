@@ -29,6 +29,22 @@ pub trait CaptionLlm {
     ) -> Result<String>;
 }
 
+/// Vision backend used by `dedup` to pick the best photo from a group of
+/// near-duplicates. Single shot: system + user text + N inline images,
+/// returns the assistant's raw message content (caller parses as JSON
+/// since `response_format` is forced to `json_object`).
+pub trait MultiImageVisionLlm {
+    /// `images` is a list of `(bytes, mime)` pairs; the prompt should
+    /// refer to them by 0-based index in the order given.
+    fn pick_best(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        images: &[(Vec<u8>, &str)],
+        max_tokens: u32,
+    ) -> Result<String>;
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Message {
     pub role: &'static str,
@@ -94,14 +110,17 @@ struct ResponseFormat {
 }
 
 // Multimodal request: messages are a mix of text and image blocks. The
-// model field is the vision model. No response_format here — we want
-// free-form text, not JSON.
+// model field is the vision model. `response_format` is optional so the
+// same struct backs both the free-form caption call and the JSON-only
+// dedup pick.
 #[derive(Serialize)]
 struct VisionRequest<'a> {
     model: &'a str,
     messages: Vec<VisionMessage<'a>>,
     temperature: f32,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
 }
 
 #[derive(Serialize)]
@@ -175,6 +194,7 @@ impl CaptionLlm for OpenAiClient {
             model,
             temperature: 0.0,
             max_tokens,
+            response_format: None,
             messages: vec![
                 VisionMessage {
                     role: "system",
@@ -198,6 +218,71 @@ impl CaptionLlm for OpenAiClient {
             .json(&body)
             .send()
             .with_context(|| format!("HTTP POST {url} (vision) failed"))?;
+        unpack_chat_content(resp, &url)
+    }
+}
+
+impl MultiImageVisionLlm for OpenAiClient {
+    fn pick_best(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        images: &[(Vec<u8>, &str)],
+        max_tokens: u32,
+    ) -> Result<String> {
+        let model = self
+            .vision_model
+            .as_deref()
+            .ok_or_else(|| anyhow!("config.llm.vision_model is not set"))?;
+        if images.is_empty() {
+            bail!("pick_best called with zero images");
+        }
+        let url = format!("{}/v1/chat/completions", self.base_url);
+
+        // Build the multipart user content: a text block, then one
+        // labelled text+image pair per candidate so the model sees the
+        // 0-based index it should reference in its JSON answer.
+        let mut content_parts = Vec::with_capacity(1 + images.len() * 2);
+        content_parts.push(serde_json::json!({ "type": "text", "text": user_prompt }));
+        for (i, (bytes, mime)) in images.iter().enumerate() {
+            let data_url = format!("data:{mime};base64,{}", B64.encode(bytes));
+            content_parts.push(serde_json::json!({
+                "type": "text",
+                "text": format!("候选 {i}："),
+            }));
+            content_parts.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": data_url },
+            }));
+        }
+
+        let body = VisionRequest {
+            model,
+            temperature: 0.0,
+            max_tokens,
+            response_format: Some(ResponseFormat {
+                kind: "json_object",
+            }),
+            messages: vec![
+                VisionMessage {
+                    role: "system",
+                    content: serde_json::Value::String(system_prompt.to_string()),
+                    _phantom: std::marker::PhantomData,
+                },
+                VisionMessage {
+                    role: "user",
+                    content: serde_json::Value::Array(content_parts),
+                    _phantom: std::marker::PhantomData,
+                },
+            ],
+        };
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .with_context(|| format!("HTTP POST {url} (vision pick) failed"))?;
         unpack_chat_content(resp, &url)
     }
 }

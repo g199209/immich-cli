@@ -1130,7 +1130,7 @@ mod tests {
                 country: Some("China".into()),
                 latitude: Some(31.0),
                 longitude: Some(121.0),
-                description: None,
+                ..Default::default()
             }),
         }
     }

@@ -101,7 +101,7 @@ pub struct Asset {
     pub exif_info: Option<ExifInfo>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ExifInfo {
     pub city: Option<String>,
@@ -109,10 +109,33 @@ pub struct ExifInfo {
     pub country: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    /// File size on disk in bytes. Used by `dedup` to short-circuit
+    /// the vision pick when one candidate is materially larger than
+    /// the rest. Optional because some Immich versions omit it on
+    /// certain endpoints.
+    #[serde(default)]
+    pub file_size_in_byte: Option<u64>,
+    /// EXIF `DateTimeOriginal`. Preferred capture-time for `dedup`
+    /// because it is invariant under timezone re-interpretation
+    /// (unlike `localDateTime`). Falls back to `localDateTime` when
+    /// absent.
+    #[serde(default)]
+    pub date_time_original: Option<String>,
     /// Free-form text (EXIF UserComment / ImageDescription). The `ask`
     /// command reads this for LLM-mediated semantic search.
     #[serde(default)]
     pub description: Option<String>,
+}
+
+/// One group of perceptually-identical assets returned by
+/// `GET /api/duplicates`. The endpoint reports every asset the server
+/// considers a near-duplicate of at least one other; consumers decide
+/// how to pick a winner and optionally stack the rest.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateGroup {
+    pub duplicate_id: String,
+    pub assets: Vec<Asset>,
 }
 
 /// One stack from `GET /api/stacks`. A stack groups several assets under a

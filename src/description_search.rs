@@ -506,12 +506,8 @@ mod tests {
             local_date_time: None,
             checksum: String::new(),
             exif_info: Some(ExifInfo {
-                city: None,
-                state: None,
-                country: None,
-                latitude: None,
-                longitude: None,
                 description: Some(format!("desc-{id}")),
+                ..Default::default()
             }),
         }
     }

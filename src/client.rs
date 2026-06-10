@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::models::{SearchRequest, SearchResponse, Stack};
+use crate::models::{DuplicateGroup, SearchRequest, SearchResponse, Stack};
 use crate::places::CityVocabEntry;
 use anyhow::{anyhow, bail, Context, Result};
 use std::time::Duration;
@@ -43,6 +43,31 @@ pub trait StacksBackend {
     /// `GET /api/stacks` — every stack owned by the caller, each with its
     /// primary (cover) asset id and member assets.
     fn stacks(&self) -> Result<Vec<Stack>>;
+}
+
+/// Read half of the `dedup` backend: enumerate near-duplicate groups.
+/// The server-side similarity model is run during ML processing; we only
+/// consume the result.
+pub trait DuplicatesBackend {
+    /// `GET /api/duplicates` — every duplicate group the caller can see.
+    /// Each group's `assets` typically embeds `exifInfo` already, so the
+    /// dedup pipeline does not need a separate fetch per asset.
+    fn duplicates(&self) -> Result<Vec<DuplicateGroup>>;
+}
+
+/// Write half of the `dedup` backend: mutate assets and create stacks.
+/// Both endpoints require an API key with `asset.update` / `stack.create`
+/// scopes; without them the server returns 403.
+pub trait DedupWriteBackend {
+    /// `PUT /api/assets/{id}` with `{latitude, longitude}` — copies GPS
+    /// from a sibling asset onto one that is missing coordinates. Other
+    /// fields are left untouched.
+    fn update_asset_location(&self, id: &str, latitude: f64, longitude: f64) -> Result<()>;
+
+    /// `POST /api/stacks` with `{assetIds: [...]}`. Immich treats the
+    /// first id in the array as the primary (cover) asset, so callers
+    /// MUST put the winner first.
+    fn create_stack(&self, asset_ids: &[String]) -> Result<Stack>;
 }
 
 /// Backend the `info` subcommand talks to. Separate from `SearchBackend`
@@ -173,6 +198,48 @@ impl StacksBackend for ImmichClient {
     fn stacks(&self) -> Result<Vec<Stack>> {
         let raw = self.get_json("/api/stacks")?;
         serde_json::from_value(raw).context("failed to decode /api/stacks response")
+    }
+}
+
+impl DuplicatesBackend for ImmichClient {
+    fn duplicates(&self) -> Result<Vec<DuplicateGroup>> {
+        let raw = self.get_json("/api/duplicates")?;
+        serde_json::from_value(raw).context("failed to decode /api/duplicates response")
+    }
+}
+
+impl DedupWriteBackend for ImmichClient {
+    fn update_asset_location(&self, id: &str, latitude: f64, longitude: f64) -> Result<()> {
+        let url = format!("{}/api/assets/{id}", self.base_url);
+        let body = serde_json::json!({
+            "latitude": latitude,
+            "longitude": longitude,
+        });
+        let resp = self
+            .http
+            .put(&url)
+            .json(&body)
+            .send()
+            .with_context(|| format!("HTTP PUT {url} (location) failed"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            bail!("Immich returned {status} for PUT {url}: {body}");
+        }
+        Ok(())
+    }
+
+    fn create_stack(&self, asset_ids: &[String]) -> Result<Stack> {
+        let url = format!("{}/api/stacks", self.base_url);
+        let body = serde_json::json!({ "assetIds": asset_ids });
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .with_context(|| format!("HTTP POST {url} failed"))?;
+        let raw = unpack_json(resp, &url)?;
+        serde_json::from_value(raw).context("failed to decode POST /api/stacks response")
     }
 }
 

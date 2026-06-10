@@ -26,6 +26,8 @@ enum Command {
     Info(commands::info::InfoArgs),
     /// Generate (or refresh) photo descriptions via a vision LLM, idempotently
     UpdateDescriptions(commands::update_descriptions::UpdateDescriptionsArgs),
+    /// Collapse near-duplicate groups into stacks (vision-model assisted)
+    Dedup(commands::dedup::DedupArgs),
 }
 
 fn main() -> Result<()> {
@@ -36,5 +38,6 @@ fn main() -> Result<()> {
         Command::Search(args) => commands::search::run(&cfg, args),
         Command::Info(args) => commands::info::run(&cfg, args),
         Command::UpdateDescriptions(args) => commands::update_descriptions::run(&cfg, args),
+        Command::Dedup(args) => commands::dedup::run(&cfg, args),
     }
 }
