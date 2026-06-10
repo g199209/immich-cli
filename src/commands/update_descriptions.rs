@@ -740,8 +740,10 @@ where
         caption_be,
         llm,
         &work,
-        &cfg.people,
-        admin2_lookup,
+        PromptDeps {
+            people_map: &cfg.people,
+            admin2_lookup,
+        },
         args.parallel as usize,
         args.verbose,
         log,
@@ -771,14 +773,24 @@ fn write_verbose_prompt_facts<W: std::io::Write>(
     )
 }
 
+/// References to the two inputs every prompt build needs: the user's
+/// configured people map (for identity context) and the admin2 lookup
+/// (for second-level administrative region enrichment). Bundled because
+/// they're always passed together and would otherwise push the
+/// orchestrator over clippy's argument-count threshold.
+#[derive(Copy, Clone)]
+struct PromptDeps<'a> {
+    people_map: &'a BTreeMap<String, Vec<String>>,
+    admin2_lookup: &'a Admin2Lookup,
+}
+
 /// Run vision + PUT for each item in parallel. Errors on individual
 /// assets are logged but do not abort the whole run.
 fn process_in_parallel<C, V, W>(
     caption_be: &C,
     llm: &V,
     work: &[&(Asset, Decision)],
-    people_map: &BTreeMap<String, Vec<String>>,
-    admin2_lookup: &Admin2Lookup,
+    deps: PromptDeps<'_>,
     parallel: usize,
     verbose: bool,
     log: &mut W,
@@ -805,7 +817,12 @@ where
                     Decision::Caption(r) => *r,
                     Decision::Skip(_) => unreachable!("filtered above"),
                 };
-                let res = build_caption_prompt_parts(caption_be, asset, people_map, admin2_lookup)
+                let res = build_caption_prompt_parts(
+                    caption_be,
+                    asset,
+                    deps.people_map,
+                    deps.admin2_lookup,
+                )
                     .and_then(|prompt| {
                         if verbose {
                             let mut log = log_lock.lock().unwrap();
