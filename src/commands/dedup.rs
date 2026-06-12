@@ -5,25 +5,45 @@
 //!      (avoid double-stacking the same shot).
 //!   2. **Skip** if any member is a video — the user has not asked us
 //!      to make video judgement calls.
-//!   3. **Skip** if members come from different parent folders — a
-//!      cross-folder match is almost always a coincidence we don't
-//!      want to act on.
-//!   4. **Skip** if earliest/latest capture time differ by more than
+//!   3. **Auto-delete (images)** if every member is an image with the
+//!      same filename, the same capture time, AND file sizes within
+//!      0.1% of each other, but lives in a different folder. These
+//!      are exact cross-folder copies the user filed in multiple
+//!      places; keep the one with GPS (or any one, if all/none have
+//!      GPS) and DELETE the rest. No stack is created. The size check
+//!      is the safety belt: a `/raw/` vs `/retouched/` pair with
+//!      identical EXIF time would otherwise be indistinguishable from
+//!      a true copy and we'd wrongly nuke the retouched version. A
+//!      0.1% tolerance absorbs tiny EXIF re-writes (e.g. an embedded
+//!      thumbnail refresh) without admitting genuinely different
+//!      exports.
+//!   3b.**Auto-delete (videos)** if every member is a video with the
+//!      same filename, the same capture time, different folders, and
+//!      file sizes that are NOT all equal. Keep the largest (assumed
+//!      original / highest-quality) and DELETE the rest. If the
+//!      keeper lacks GPS but a sibling has it, copy the sibling's
+//!      coords onto the keeper before deletion. Equal-size video
+//!      groups fall through to the regular ContainsVideo skip for
+//!      manual review.
+//!   4. **Skip** if members come from different parent folders — a
+//!      cross-folder match that isn't an exact-name+time duplicate is
+//!      almost always a coincidence we don't want to act on.
+//!   5. **Skip** if earliest/latest capture time differ by more than
 //!      `--max-time-gap` (default 10 min).
-//!   5. **Skip** if ALL members have GPS and the pairwise great-circle
+//!   6. **Skip** if ALL members have GPS and the pairwise great-circle
 //!      distance exceeds `--max-distance-m` (default 500m). When some
 //!      members are missing GPS we keep the group and copy coords later.
-//!   6. **Pick a winner**:
+//!   7. **Pick a winner**:
 //!        * If the largest file is more than `--size-ratio` larger than
 //!          the smallest (default 50%), pick the largest. The assumption
 //!          is the smaller siblings are downsamples/re-exports.
 //!        * Otherwise, ask the vision LLM to compare composition,
 //!          content, and liveliness — it returns the winner index in JSON.
-//!   7. **Backfill GPS**: if the winner has coords but some siblings
+//!   8. **Backfill GPS**: if the winner has coords but some siblings
 //!      do not, PUT the winner's coords onto them. (Or, if the winner
 //!      lacks coords but a sibling has them, copy from the sibling
 //!      onto every missing one — winner included.)
-//!   8. **Stack**: POST /api/stacks with the winner first so it becomes
+//!   9. **Stack**: POST /api/stacks with the winner first so it becomes
 //!      the cover.
 //!
 //! Default mode is dry-run; pass `--apply` to actually mutate Immich.
@@ -38,11 +58,18 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Token budget for the vision pick call. The model must only emit a
 /// short JSON object — 1K leaves plenty of room for reasoning tokens on
 /// reasoning models.
 const MAX_PICK_TOKENS: u32 = 1024;
+
+/// Tolerance for the auto-delete size-equality check. `(max - min) / max`
+/// must be ≤ this. 0.001 = 0.1% — enough to absorb an EXIF rewrite
+/// without admitting a different export.
+const AUTO_DELETE_MAX_SIZE_GAP: f64 = 0.001;
 
 #[derive(Args, Debug)]
 pub struct DedupArgs {
@@ -74,6 +101,13 @@ pub struct DedupArgs {
     #[arg(long, default_value_t = 0)]
     pub limit: u32,
 
+    /// Number of concurrent workers for the plan-and-apply phase. Each
+    /// worker holds one group and does its thumbnail fetches, vision
+    /// call, and HTTP writes. Raise carefully — the upstream vision
+    /// gateway may rate-limit.
+    #[arg(long, default_value_t = 4)]
+    pub parallel: u32,
+
     /// Print the per-group decision (skip reason, winner, vision rationale).
     #[arg(long)]
     pub verbose: bool,
@@ -96,9 +130,20 @@ pub enum SkipReason {
 
 /// What we plan to do with a single group: either skip with a reason
 /// or act, pending the (LLM-resolved) winner selection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GroupDecision {
     Skip(SkipReason),
+    /// Exact cross-folder copies (same filename + same capture time +
+    /// matching size or largest-of-videos, different folders). Keep
+    /// `keeper_idx`, delete every other member. No vision call, no
+    /// stack. If `gps_backfill` is `Some`, the keeper itself is
+    /// missing GPS and we should PUT those coords onto it before
+    /// deleting the source sibling. Used by the video rule, where
+    /// the keeper is chosen by file size rather than by GPS presence.
+    AutoDeleteDupes {
+        keeper_idx: usize,
+        gps_backfill: Option<(f64, f64)>,
+    },
     /// Pre-filter accepted the group; the winner still needs to be
     /// picked by [`pick_winner_by_size`] or the vision model.
     Consider,
@@ -123,19 +168,28 @@ pub fn haversine_m(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
     2.0 * earth_r * a.sqrt().asin()
 }
 
-/// Parse Immich's `localDateTime` / `dateTimeOriginal` strings to UTC
-/// seconds. They look like `2024-03-12T17:08:42.000` or
-/// `2024-03-12T17:08:42` — no timezone, since the field is already in
-/// local time. We just treat the wall-clock as if it were UTC; for time
-/// **gap** comparisons within a single duplicate group that is
-/// equivalent to using local times directly.
+/// Parse the various ISO-8601 shapes Immich emits across `dateTimeOriginal`,
+/// `localDateTime`, and `fileCreatedAt`. Returns UTC seconds.
+///
+/// Real-world examples we have to swallow:
+///   * `2024-03-12T09:08:42.000Z`        — `fileCreatedAt` (UTC)
+///   * `2024-03-12T17:08:42.000+08:00`   — `dateTimeOriginal` with offset
+///   * `2024-03-12T17:08:42.000`         — `localDateTime` (no zone)
+///   * `2024-03-12T17:08:42`             — same, sub-second omitted
+///
+/// For time-**gap** comparisons inside one duplicate group, all assets
+/// share a single capture context, so treating the naive variants as
+/// UTC is safe — the deltas are unchanged.
 pub fn parse_capture_seconds(s: &str) -> Option<i64> {
-    use chrono::NaiveDateTime;
-    // Strip a trailing `Z` if present; some servers emit it on a field
-    // that is otherwise naive.
-    let trimmed = s.trim_end_matches('Z');
+    use chrono::{DateTime, NaiveDateTime};
+    // RFC3339 covers `Z` and `±HH:MM` offsets; try it first since it
+    // gives an absolute instant directly.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
+    }
+    // Naive (zoneless) fallback — Immich emits this for `localDateTime`.
     for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
             return Some(dt.and_utc().timestamp());
         }
     }
@@ -160,6 +214,20 @@ fn asset_size(a: &Asset) -> Option<u64> {
     a.exif_info.as_ref().and_then(|e| e.file_size_in_byte)
 }
 
+/// True iff `(max - min) / max <= max_gap`. Empty slices and an all-zero
+/// `max` are treated as "close enough" so the caller doesn't need to
+/// special-case them — the surrounding rule already requires every
+/// member to report a size, so a 0 here is a real (if odd) value.
+pub fn sizes_within_tolerance(sizes: &[u64], max_gap: f64) -> bool {
+    let (Some(&min), Some(&max)) = (sizes.iter().min(), sizes.iter().max()) else {
+        return true;
+    };
+    if max == 0 {
+        return true;
+    }
+    (1.0 - (min as f64 / max as f64)) <= max_gap
+}
+
 /// Run all pre-filters from rules 1-5. Returns either a skip reason or
 /// `Consider`, in which case the caller proceeds to picking a winner.
 pub fn classify_group(
@@ -174,6 +242,66 @@ pub fn classify_group(
     if group.assets.iter().any(|a| stacked.contains(&a.id)) {
         return GroupDecision::Skip(SkipReason::AlreadyStacked);
     }
+    let folders: HashSet<&str> = group
+        .assets
+        .iter()
+        .map(|a| parent_dir(&a.original_path))
+        .collect();
+
+    // Rule 2.4 — all-videos cross-folder near-copy: same basename,
+    // same capture time, different folders, file sizes NOT all equal.
+    // Keep the largest (treated as the original / highest-quality
+    // copy) and delete the rest. If the keeper lacks GPS but a sibling
+    // has it, plan a backfill onto the keeper before the delete so
+    // location metadata survives.
+    let all_videos = group
+        .assets
+        .iter()
+        .all(|a| a.asset_type.eq_ignore_ascii_case("VIDEO"));
+    if all_videos && folders.len() > 1 {
+        let names: HashSet<&str> = group
+            .assets
+            .iter()
+            .map(|a| a.original_file_name.as_str())
+            .collect();
+        if names.len() == 1 {
+            let times: Option<Vec<i64>> = group
+                .assets
+                .iter()
+                .map(asset_capture_time_seconds)
+                .collect();
+            let sizes: Option<Vec<u64>> = group.assets.iter().map(asset_size).collect();
+            if let (Some(times), Some(sizes)) = (times, sizes) {
+                let times_equal = times.iter().min() == times.iter().max();
+                let max_size = *sizes.iter().max().unwrap();
+                let min_size = *sizes.iter().min().unwrap();
+                if times_equal && max_size > min_size {
+                    // First occurrence of the max wins on ties.
+                    let keeper_idx = sizes.iter().position(|s| *s == max_size).unwrap();
+                    let gps_backfill = if asset_gps(&group.assets[keeper_idx]).is_some() {
+                        None
+                    } else {
+                        group
+                            .assets
+                            .iter()
+                            .enumerate()
+                            .find_map(|(i, a)| {
+                                if i == keeper_idx {
+                                    None
+                                } else {
+                                    asset_gps(a)
+                                }
+                            })
+                    };
+                    return GroupDecision::AutoDeleteDupes {
+                        keeper_idx,
+                        gps_backfill,
+                    };
+                }
+            }
+        }
+    }
+
     if group
         .assets
         .iter()
@@ -181,11 +309,46 @@ pub fn classify_group(
     {
         return GroupDecision::Skip(SkipReason::ContainsVideo);
     }
-    let folders: HashSet<&str> = group
-        .assets
-        .iter()
-        .map(|a| parent_dir(&a.original_path))
-        .collect();
+
+    // Rule 2.5 — exact cross-folder duplicates: same basename, same
+    // capture-time-to-the-second, same byte size, only the folder
+    // differs. The user typically created these by copying one shoot
+    // into multiple archive folders. We don't need a vision pick:
+    // keep one copy (preferring one that already has GPS so we don't
+    // lose metadata) and delete the rest. Size equality is what
+    // separates true copies from same-name+same-time edits (e.g.
+    // `/raw/foo.jpg` vs `/retouched/foo.jpg`).
+    if folders.len() > 1 {
+        let names: HashSet<&str> = group
+            .assets
+            .iter()
+            .map(|a| a.original_file_name.as_str())
+            .collect();
+        if names.len() == 1 {
+            let times: Option<Vec<i64>> = group
+                .assets
+                .iter()
+                .map(asset_capture_time_seconds)
+                .collect();
+            let sizes: Option<Vec<u64>> = group.assets.iter().map(asset_size).collect();
+            if let (Some(times), Some(sizes)) = (times, sizes) {
+                let times_equal = times.iter().min() == times.iter().max();
+                let sizes_close = sizes_within_tolerance(&sizes, AUTO_DELETE_MAX_SIZE_GAP);
+                if times_equal && sizes_close {
+                    let keeper_idx = group
+                        .assets
+                        .iter()
+                        .position(|a| asset_gps(a).is_some())
+                        .unwrap_or(0);
+                    return GroupDecision::AutoDeleteDupes {
+                        keeper_idx,
+                        gps_backfill: None,
+                    };
+                }
+            }
+        }
+    }
+
     if folders.len() != 1 {
         return GroupDecision::Skip(SkipReason::DifferentFolders);
     }
@@ -248,10 +411,11 @@ const PICK_SYSTEM_PROMPT: &str =
 你的输出会作为脚本的输入，必须严格遵守 JSON 格式，且只输出一个 JSON 对象，不要附加任何额外说明。";
 
 const PICK_USER_PROMPT_HEAD: &str = "下面给你一组照片，它们被 Immich 判定为视觉上几乎相同的重复。\
-请只从以下三个角度比较，挑出**最值得保留**的一张：\n\
+请只从以下几个角度比较，挑出**最值得保留**的一张：\n\
 1. 构图（取景、主体位置、画面平衡、有无明显裁切失误或手抖）\n\
 2. 内容（人物表情/姿态是否最自然，主体是否最完整、是否被遮挡）\n\
 3. 生动程度（光线、清晰度、色彩、瞬间感）\n\n\
+4. 人物漂亮程度，偏向美颜风格\n\n\
 比较时请忽略文件名、文件大小、缩略图分辨率差异；只看图像本身。\n\n\
 请输出如下 JSON：\n\
 ```\n\
@@ -460,11 +624,14 @@ pub fn run_with<D, S, C, W, V, Log>(
 where
     D: DuplicatesBackend,
     S: StacksBackend,
-    C: CaptionBackend,
-    W: DedupWriteBackend,
-    V: MultiImageVisionLlm,
-    Log: std::io::Write,
+    C: CaptionBackend + Sync,
+    W: DedupWriteBackend + Sync,
+    V: MultiImageVisionLlm + Sync,
+    Log: std::io::Write + Send,
 {
+    if args.parallel == 0 {
+        bail!("--parallel must be > 0");
+    }
     if args.max_time_gap_secs < 0 {
         bail!("--max-time-gap-secs must be >= 0");
     }
@@ -489,94 +656,307 @@ where
         }
     }
 
+    // Phase 1 — classify every group sequentially. Pure CPU work
+    // (string ops, haversine, time parsing), no IO, so there's no
+    // reason to parallelize it. Side effect: verbose skip lines are
+    // emitted here, in source order, before any work output.
     let mut counts = Counts::default();
-    let mut acted = 0u32;
-    let cap = if args.limit == 0 {
-        u32::MAX
-    } else {
-        args.limit
-    };
-
+    let mut to_process: Vec<&DuplicateGroup> = Vec::new();
+    let mut to_auto_delete: Vec<(&DuplicateGroup, usize, Option<(f64, f64)>)> = Vec::new();
     for group in &groups {
-        if acted >= cap {
-            break;
-        }
         match classify_group(group, &stacked, args.max_time_gap_secs, args.max_distance_m) {
             GroupDecision::Skip(reason) => {
                 counts.record_skip(&reason);
                 if args.verbose {
-                    writeln!(
-                        log,
-                        "skip [{:?}] group {} ({} assets)",
-                        reason,
-                        group.duplicate_id,
-                        group.assets.len()
-                    )
-                    .ok();
+                    log_skip(log, &reason, group).ok();
                 }
-                continue;
             }
-            GroupDecision::Consider => {}
+            GroupDecision::AutoDeleteDupes { keeper_idx, gps_backfill } => {
+                to_auto_delete.push((group, keeper_idx, gps_backfill));
+            }
+            GroupDecision::Consider => to_process.push(group),
         }
+    }
 
-        let plan = match plan_group(caption_be, llm, group, args.size_ratio) {
-            Ok(p) => p,
-            Err(e) => {
-                counts.plan_failed += 1;
-                writeln!(
-                    log,
-                    "FAIL plan group {} — {e:#}",
-                    group.duplicate_id
-                )
-                .ok();
-                continue;
-            }
-        };
+    if args.limit > 0 && (args.limit as usize) < to_process.len() {
+        to_process.truncate(args.limit as usize);
+    }
 
-        acted += 1;
-        log_plan(log, group, &plan, args.apply).ok();
+    // Phase 2a — auto-delete exact cross-folder duplicates. Run before
+    // the vision pipeline so the user sees these cheap actions first
+    // and so a small `--limit` doesn't starve them out. Sequential: the
+    // work per group is a single DELETE, parallelism wouldn't help.
+    let auto_del = run_auto_deletes(write_be, &to_auto_delete, args.apply, log);
+    counts.merge_auto_delete(&auto_del);
 
-        if !args.apply {
-            counts.would_apply += 1;
+    // Phase 2b — plan + apply, parallelized across groups. Each worker
+    // does N thumbnail fetches + 1 vision call + (in --apply mode) M
+    // PUTs + 1 POST, so the work is almost entirely IO-bound and
+    // parallelizing helps.
+    let work = process_groups_in_parallel(
+        caption_be,
+        llm,
+        write_be,
+        &to_process,
+        &args,
+        log,
+    );
+    counts.merge_work(&work);
+
+    counts.write_summary(log, args.apply).ok();
+    Ok(())
+}
+
+fn log_skip<W: std::io::Write>(
+    log: &mut W,
+    reason: &SkipReason,
+    group: &DuplicateGroup,
+) -> std::io::Result<()> {
+    writeln!(
+        log,
+        "skip [{:?}] group {} ({} assets)",
+        reason,
+        group.duplicate_id,
+        group.assets.len()
+    )?;
+    if *reason == SkipReason::MissingCaptureTime {
+        // Surface the strings we failed to parse so the user can spot
+        // a new format we don't handle.
+        for a in &group.assets {
+            writeln!(
+                log,
+                "  asset {} times: dateTimeOriginal={:?} localDateTime={:?} fileCreatedAt={:?}",
+                a.id,
+                a.exif_info.as_ref().and_then(|e| e.date_time_original.as_deref()),
+                a.local_date_time.as_deref(),
+                a.file_created_at.as_deref(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Counters for the auto-delete phase, folded into the run's [`Counts`]
+/// by the caller.
+#[derive(Default)]
+struct AutoDeleteCounts {
+    would_delete_groups: u32,
+    would_delete_assets: u32,
+    deleted_groups: u32,
+    deleted_assets: u32,
+    delete_failed: u32,
+}
+
+/// Execute (or, in dry-run, log) the auto-delete decisions for exact
+/// cross-folder duplicates. Errors on individual groups are logged but
+/// do not abort the run.
+fn run_auto_deletes<W, Log>(
+    write_be: &W,
+    groups: &[(&DuplicateGroup, usize, Option<(f64, f64)>)],
+    apply: bool,
+    log: &mut Log,
+) -> AutoDeleteCounts
+where
+    W: DedupWriteBackend,
+    Log: std::io::Write,
+{
+    let mut counts = AutoDeleteCounts::default();
+    let prefix = if apply { "AUTO-DELETE" } else { "DRY-RUN AUTO-DELETE" };
+    for (group, keeper_idx, gps_backfill) in groups {
+        let keeper = &group.assets[*keeper_idx];
+        let victims: Vec<String> = group
+            .assets
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != *keeper_idx)
+            .map(|(_, a)| a.id.clone())
+            .collect();
+        if victims.is_empty() {
             continue;
         }
+        let keeper_gps = if asset_gps(keeper).is_some() { "GPS" } else { "no-GPS" };
+        writeln!(
+            log,
+            "{prefix} group {} ({} assets) → keep {} {} [{keeper_gps}], delete {}",
+            group.duplicate_id,
+            group.assets.len(),
+            keeper.id,
+            keeper.original_path,
+            victims.len(),
+        )
+        .ok();
+        if let Some((lat, lng)) = gps_backfill {
+            writeln!(
+                log,
+                "  {prefix} GPS {} → ({:.6}, {:.6})",
+                keeper.id, lat, lng
+            )
+            .ok();
+        }
+        for (i, a) in group.assets.iter().enumerate() {
+            if i != *keeper_idx {
+                writeln!(log, "  {prefix} {} {}", a.id, a.original_path).ok();
+            }
+        }
 
-        let mut any_failure = false;
-        for copy in &plan.gps_backfill {
-            if let Err(e) =
-                write_be.update_asset_location(&copy.asset_id, copy.latitude, copy.longitude)
-            {
-                any_failure = true;
+        if !apply {
+            counts.would_delete_groups += 1;
+            counts.would_delete_assets += victims.len() as u32;
+            continue;
+        }
+        // Backfill GPS onto the keeper first so the location survives
+        // even if the GPS source is one of the victims we're about to
+        // delete. A backfill failure is logged but does not abort the
+        // delete — the dedup is still the user's primary intent.
+        if let Some((lat, lng)) = gps_backfill {
+            if let Err(e) = write_be.update_asset_location(&keeper.id, *lat, *lng) {
                 writeln!(
                     log,
                     "FAIL backfill GPS for {} (group {}) — {e:#}",
-                    copy.asset_id, group.duplicate_id
+                    keeper.id, group.duplicate_id
                 )
                 .ok();
             }
         }
-        match write_be.create_stack(&plan.stack_order) {
-            Ok(_) => {
-                if !any_failure {
-                    counts.applied += 1;
-                } else {
-                    counts.applied_with_warnings += 1;
-                }
+        match write_be.delete_assets(&victims) {
+            Ok(()) => {
+                counts.deleted_groups += 1;
+                counts.deleted_assets += victims.len() as u32;
             }
             Err(e) => {
-                counts.apply_failed += 1;
+                counts.delete_failed += 1;
                 writeln!(
                     log,
-                    "FAIL create stack for group {} — {e:#}",
+                    "FAIL delete group {} — {e:#}",
                     group.duplicate_id
                 )
                 .ok();
             }
         }
     }
+    counts
+}
 
-    counts.write_summary(log, args.apply).ok();
-    Ok(())
+/// Counters touched by the parallel workers. Returned by
+/// [`process_groups_in_parallel`] and folded into the run's [`Counts`]
+/// by the caller — keeps the parallel code free of borrowing concerns.
+#[derive(Default)]
+struct WorkCounts {
+    plan_failed: u32,
+    would_apply: u32,
+    applied: u32,
+    applied_with_warnings: u32,
+    apply_failed: u32,
+}
+
+/// Plan + (optionally) apply each accepted group in parallel. Errors
+/// on individual groups are logged but do not abort the whole run.
+fn process_groups_in_parallel<C, V, W, Log>(
+    caption_be: &C,
+    llm: &V,
+    write_be: &W,
+    groups: &[&DuplicateGroup],
+    args: &DedupArgs,
+    log: &mut Log,
+) -> WorkCounts
+where
+    C: CaptionBackend + Sync,
+    W: DedupWriteBackend + Sync,
+    V: MultiImageVisionLlm + Sync,
+    Log: std::io::Write + Send,
+{
+    if groups.is_empty() {
+        return WorkCounts::default();
+    }
+    let plan_failed = AtomicU32::new(0);
+    let would_apply = AtomicU32::new(0);
+    let applied = AtomicU32::new(0);
+    let applied_with_warnings = AtomicU32::new(0);
+    let apply_failed = AtomicU32::new(0);
+
+    let next = AtomicUsize::new(0);
+    let log_lock = Mutex::new(log);
+    let parallel = (args.parallel as usize).min(groups.len()).max(1);
+    // `args` field reads here so the closure captures only Copy values.
+    let apply = args.apply;
+    let size_ratio = args.size_ratio;
+
+    std::thread::scope(|scope| {
+        for _ in 0..parallel {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= groups.len() {
+                    break;
+                }
+                let group = groups[i];
+
+                let plan = match plan_group(caption_be, llm, group, size_ratio) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        plan_failed.fetch_add(1, Ordering::SeqCst);
+                        let mut log = log_lock.lock().unwrap();
+                        writeln!(*log, "FAIL plan group {} — {e:#}", group.duplicate_id).ok();
+                        continue;
+                    }
+                };
+
+                {
+                    let mut log = log_lock.lock().unwrap();
+                    log_plan(&mut *log, group, &plan, apply).ok();
+                }
+
+                if !apply {
+                    would_apply.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+
+                let mut any_failure = false;
+                for copy in &plan.gps_backfill {
+                    if let Err(e) = write_be.update_asset_location(
+                        &copy.asset_id,
+                        copy.latitude,
+                        copy.longitude,
+                    ) {
+                        any_failure = true;
+                        let mut log = log_lock.lock().unwrap();
+                        writeln!(
+                            *log,
+                            "FAIL backfill GPS for {} (group {}) — {e:#}",
+                            copy.asset_id, group.duplicate_id
+                        )
+                        .ok();
+                    }
+                }
+                match write_be.create_stack(&plan.stack_order) {
+                    Ok(_) => {
+                        if any_failure {
+                            applied_with_warnings.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            applied.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    Err(e) => {
+                        apply_failed.fetch_add(1, Ordering::SeqCst);
+                        let mut log = log_lock.lock().unwrap();
+                        writeln!(
+                            *log,
+                            "FAIL create stack for group {} — {e:#}",
+                            group.duplicate_id
+                        )
+                        .ok();
+                    }
+                }
+            });
+        }
+    });
+
+    WorkCounts {
+        plan_failed: plan_failed.into_inner(),
+        would_apply: would_apply.into_inner(),
+        applied: applied.into_inner(),
+        applied_with_warnings: applied_with_warnings.into_inner(),
+        apply_failed: apply_failed.into_inner(),
+    }
 }
 
 fn log_plan<W: std::io::Write>(
@@ -626,6 +1006,11 @@ struct Counts {
     applied: u32,
     applied_with_warnings: u32,
     apply_failed: u32,
+    would_delete_groups: u32,
+    would_delete_assets: u32,
+    deleted_groups: u32,
+    deleted_assets: u32,
+    delete_failed: u32,
 }
 
 impl Counts {
@@ -639,6 +1024,22 @@ impl Counts {
             SkipReason::DistanceTooLarge => self.distance_too_large += 1,
             SkipReason::MissingCaptureTime => self.missing_capture_time += 1,
         }
+    }
+
+    fn merge_work(&mut self, w: &WorkCounts) {
+        self.plan_failed += w.plan_failed;
+        self.would_apply += w.would_apply;
+        self.applied += w.applied;
+        self.applied_with_warnings += w.applied_with_warnings;
+        self.apply_failed += w.apply_failed;
+    }
+
+    fn merge_auto_delete(&mut self, d: &AutoDeleteCounts) {
+        self.would_delete_groups += d.would_delete_groups;
+        self.would_delete_assets += d.would_delete_assets;
+        self.deleted_groups += d.deleted_groups;
+        self.deleted_assets += d.deleted_assets;
+        self.delete_failed += d.delete_failed;
     }
 
     fn write_summary<W: std::io::Write>(
@@ -660,10 +1061,20 @@ impl Counts {
         if apply {
             writeln!(
                 log,
+                "auto-deleted: {} group(s), {} asset(s); {} failed",
+                self.deleted_groups, self.deleted_assets, self.delete_failed,
+            )?;
+            writeln!(
+                log,
                 "applied: {} ok, {} ok-with-warnings, {} stack failed, {} plan failed",
                 self.applied, self.applied_with_warnings, self.apply_failed, self.plan_failed,
             )?;
         } else {
+            writeln!(
+                log,
+                "would auto-delete: {} group(s), {} asset(s)",
+                self.would_delete_groups, self.would_delete_assets,
+            )?;
             writeln!(
                 log,
                 "would apply: {} group(s); {} plan failed",
@@ -680,7 +1091,6 @@ impl Counts {
 mod tests {
     use super::*;
     use crate::models::{ExifInfo, Stack, StackMember};
-    use std::cell::RefCell;
     use std::collections::HashMap;
 
     fn asset(id: &str, path: &str) -> Asset {
@@ -697,6 +1107,12 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    fn video(id: &str, path: &str) -> Asset {
+        let mut a = asset(id, path);
+        a.asset_type = "VIDEO".into();
+        a
     }
 
     fn with_time(mut a: Asset, t: &str) -> Asset {
@@ -753,6 +1169,17 @@ mod tests {
         let a = parse_capture_seconds("2024-03-12T17:08:42").unwrap();
         let b = parse_capture_seconds("2024-03-12T17:08:42.000").unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn parse_capture_seconds_accepts_rfc3339_zulu_and_offset() {
+        // Z and +08:00 must both parse to the same absolute instant.
+        let zulu = parse_capture_seconds("2024-03-12T09:08:42.000Z").unwrap();
+        let plus8 = parse_capture_seconds("2024-03-12T17:08:42.000+08:00").unwrap();
+        assert_eq!(zulu, plus8, "Z and +08:00 should denote the same instant");
+        // And without sub-second.
+        let zulu_nofrac = parse_capture_seconds("2024-03-12T09:08:42Z").unwrap();
+        assert_eq!(zulu_nofrac, zulu);
     }
 
     #[test]
@@ -837,6 +1264,223 @@ mod tests {
         );
         let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
         assert_eq!(dec, GroupDecision::Consider);
+    }
+
+    #[test]
+    fn classify_auto_deletes_same_name_same_time_same_size_diff_folder_prefers_gps() {
+        // Same basename, same capture time, same byte size, two folders.
+        // Only b has GPS, so b must be the keeper even though a comes
+        // first.
+        let g = group(
+            "g",
+            vec![
+                with_size(asset("a", "/x/IMG_001.jpg"), 2_000_000),
+                with_size(with_gps(asset("b", "/y/IMG_001.jpg"), 31.0, 121.0), 2_000_000),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::AutoDeleteDupes { keeper_idx: 1, gps_backfill: None });
+    }
+
+    #[test]
+    fn classify_auto_deletes_all_with_gps_picks_first() {
+        // All three have GPS → "随便选一张" → the first (index 0).
+        let g = group(
+            "g",
+            vec![
+                with_size(with_gps(asset("a", "/x/IMG_1.jpg"), 31.0, 121.0), 2_000_000),
+                with_size(with_gps(asset("b", "/y/IMG_1.jpg"), 31.0, 121.0), 2_000_000),
+                with_size(with_gps(asset("c", "/z/IMG_1.jpg"), 31.0, 121.0), 2_000_000),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::AutoDeleteDupes { keeper_idx: 0, gps_backfill: None });
+    }
+
+    #[test]
+    fn classify_auto_deletes_none_with_gps_picks_first() {
+        // None have GPS — still safe to dedupe by hand, keep the first.
+        let g = group(
+            "g",
+            vec![
+                with_size(asset("a", "/x/IMG_1.jpg"), 2_000_000),
+                with_size(asset("b", "/y/IMG_1.jpg"), 2_000_000),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::AutoDeleteDupes { keeper_idx: 0, gps_backfill: None });
+    }
+
+    #[test]
+    fn classify_does_not_auto_delete_when_sizes_differ() {
+        // Same name + same time + different folder but DIFFERENT sizes
+        // — the classic /raw/ vs /retouched/ pair. Must fall through
+        // to the normal folder skip, not auto-delete.
+        let g = group(
+            "g",
+            vec![
+                with_size(asset("a", "/raw/IMG_1.jpg"), 5_000_000),
+                with_size(asset("b", "/retouched/IMG_1.jpg"), 3_000_000),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::Skip(SkipReason::DifferentFolders));
+    }
+
+    #[test]
+    fn classify_auto_deletes_when_sizes_differ_within_tolerance() {
+        // 2_000_000 vs 2_001_000 → 0.05% gap, under the 0.1% ceiling.
+        // EXIF-rewrite shouldn't block the rule.
+        let g = group(
+            "g",
+            vec![
+                with_size(asset("a", "/x/IMG_1.jpg"), 2_000_000),
+                with_size(asset("b", "/y/IMG_1.jpg"), 2_001_000),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::AutoDeleteDupes { keeper_idx: 0, gps_backfill: None });
+    }
+
+    #[test]
+    fn classify_does_not_auto_delete_when_sizes_just_outside_tolerance() {
+        // 2_000_000 vs 2_010_000 → 0.5% gap, over the 0.1% ceiling.
+        let g = group(
+            "g",
+            vec![
+                with_size(asset("a", "/x/IMG_1.jpg"), 2_000_000),
+                with_size(asset("b", "/y/IMG_1.jpg"), 2_010_000),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::Skip(SkipReason::DifferentFolders));
+    }
+
+    #[test]
+    fn classify_does_not_auto_delete_when_any_size_missing() {
+        // Without a size we can't prove byte-equality, so be safe.
+        let g = group(
+            "g",
+            vec![
+                with_size(asset("a", "/x/IMG_1.jpg"), 2_000_000),
+                asset("b", "/y/IMG_1.jpg"),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::Skip(SkipReason::DifferentFolders));
+    }
+
+    #[test]
+    fn classify_auto_deletes_video_keeps_largest_no_backfill_needed() {
+        // Two videos, same name + same time, different folders, sizes
+        // differ. Keeper = larger (b). Both have GPS → no backfill.
+        let g = group(
+            "g",
+            vec![
+                with_size(with_gps(video("a", "/x/VID.mp4"), 31.0, 121.0), 5_000_000),
+                with_size(with_gps(video("b", "/y/VID.mp4"), 31.0, 121.0), 9_000_000),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(
+            dec,
+            GroupDecision::AutoDeleteDupes { keeper_idx: 1, gps_backfill: None }
+        );
+    }
+
+    #[test]
+    fn classify_auto_deletes_video_backfills_gps_to_keeper() {
+        // Keeper (larger) has no GPS; sibling does → must plan a
+        // backfill onto the keeper before deletion.
+        let g = group(
+            "g",
+            vec![
+                with_size(with_gps(video("a", "/x/VID.mp4"), 31.5, 121.5), 5_000_000),
+                with_size(video("b", "/y/VID.mp4"), 9_000_000),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(
+            dec,
+            GroupDecision::AutoDeleteDupes {
+                keeper_idx: 1,
+                gps_backfill: Some((31.5, 121.5)),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_does_not_auto_delete_videos_when_sizes_equal() {
+        // Equal-size videos: user explicitly wanted size-DIFFERS as the
+        // trigger, so this falls through to the ContainsVideo skip.
+        let g = group(
+            "g",
+            vec![
+                with_size(video("a", "/x/VID.mp4"), 5_000_000),
+                with_size(video("b", "/y/VID.mp4"), 5_000_000),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::Skip(SkipReason::ContainsVideo));
+    }
+
+    #[test]
+    fn classify_does_not_auto_delete_videos_when_names_differ() {
+        let g = group(
+            "g",
+            vec![
+                with_size(video("a", "/x/VID_1.mp4"), 5_000_000),
+                with_size(video("b", "/y/VID_2.mp4"), 9_000_000),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::Skip(SkipReason::ContainsVideo));
+    }
+
+    #[test]
+    fn classify_does_not_auto_delete_mixed_image_video_group() {
+        // One image + one video → not all-videos → falls through to
+        // ContainsVideo skip even with matching name/time.
+        let g = group(
+            "g",
+            vec![
+                with_size(asset("a", "/x/foo.jpg"), 5_000_000),
+                with_size(video("b", "/y/foo.jpg"), 9_000_000),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::Skip(SkipReason::ContainsVideo));
+    }
+
+    #[test]
+    fn classify_does_not_auto_delete_when_filenames_differ() {
+        // Same folder pair, different filenames → fall through to the
+        // usual DifferentFolders skip.
+        let g = group(
+            "g",
+            vec![
+                asset("a", "/x/IMG_1.jpg"),
+                asset("b", "/y/IMG_2.jpg"),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::Skip(SkipReason::DifferentFolders));
+    }
+
+    #[test]
+    fn classify_does_not_auto_delete_when_capture_times_differ() {
+        let g = group(
+            "g",
+            vec![
+                with_time(asset("a", "/x/IMG_1.jpg"), "2024-03-12T17:08:42"),
+                with_time(asset("b", "/y/IMG_1.jpg"), "2024-03-12T17:08:43"),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        // Same filename, but times differ by 1s → not an exact dup.
+        // Two folders, two times in the same gap → falls into
+        // DifferentFolders skip.
+        assert_eq!(dec, GroupDecision::Skip(SkipReason::DifferentFolders));
     }
 
     #[test]
@@ -998,8 +1642,9 @@ mod tests {
 
     #[derive(Default)]
     struct FakeWrite {
-        locations: RefCell<Vec<(String, f64, f64)>>,
-        stacks: RefCell<Vec<Vec<String>>>,
+        locations: Mutex<Vec<(String, f64, f64)>>,
+        stacks: Mutex<Vec<Vec<String>>>,
+        deletes: Mutex<Vec<Vec<String>>>,
     }
     impl DedupWriteBackend for FakeWrite {
         fn update_asset_location(
@@ -1009,12 +1654,13 @@ mod tests {
             longitude: f64,
         ) -> Result<()> {
             self.locations
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push((id.into(), latitude, longitude));
             Ok(())
         }
         fn create_stack(&self, asset_ids: &[String]) -> Result<Stack> {
-            self.stacks.borrow_mut().push(asset_ids.to_vec());
+            self.stacks.lock().unwrap().push(asset_ids.to_vec());
             Ok(Stack {
                 primary_asset_id: asset_ids[0].clone(),
                 assets: asset_ids
@@ -1023,13 +1669,17 @@ mod tests {
                     .collect(),
             })
         }
+        fn delete_assets(&self, ids: &[String]) -> Result<()> {
+            self.deletes.lock().unwrap().push(ids.to_vec());
+            Ok(())
+        }
     }
 
     /// Vision fake: returns a winner_index per duplicate_id (or a default).
     struct FakeVision {
         replies: HashMap<String, usize>,
         default_idx: usize,
-        calls: RefCell<u32>,
+        calls: Mutex<u32>,
     }
     impl MultiImageVisionLlm for FakeVision {
         fn pick_best(
@@ -1039,7 +1689,7 @@ mod tests {
             images: &[(Vec<u8>, &str)],
             _max_tokens: u32,
         ) -> Result<String> {
-            *self.calls.borrow_mut() += 1;
+            *self.calls.lock().unwrap() += 1;
             // The fake doesn't know which group it is; index by call count.
             let _ = user_prompt;
             let _ = images;
@@ -1060,6 +1710,7 @@ mod tests {
             max_distance_m: 500.0,
             size_ratio: 0.5,
             limit: 0,
+            parallel: 1,
             verbose: true,
         }
     }
@@ -1081,16 +1732,16 @@ mod tests {
         let vision = FakeVision {
             replies: HashMap::new(),
             default_idx: 0,
-            calls: RefCell::new(0),
+            calls: Mutex::new(0),
         };
         let mut log = Vec::new();
         run_with(&dups, &stacks, &caption, &write, &vision, args(false), &mut log).unwrap();
-        assert!(write.locations.borrow().is_empty());
-        assert!(write.stacks.borrow().is_empty());
+        assert!(write.locations.lock().unwrap().is_empty());
+        assert!(write.stacks.lock().unwrap().is_empty());
         let s = String::from_utf8(log).unwrap();
         assert!(s.contains("DRY-RUN"), "{s}");
         // Size short-circuit fired → vision NOT called.
-        assert_eq!(*vision.calls.borrow(), 0);
+        assert_eq!(*vision.calls.lock().unwrap(), 0);
     }
 
     #[test]
@@ -1110,11 +1761,11 @@ mod tests {
         let vision = FakeVision {
             replies: HashMap::new(),
             default_idx: 0,
-            calls: RefCell::new(0),
+            calls: Mutex::new(0),
         };
         let mut log = Vec::new();
         run_with(&dups, &stacks, &caption, &write, &vision, args(true), &mut log).unwrap();
-        let posts = write.stacks.borrow().clone();
+        let posts = write.stacks.lock().unwrap().clone();
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0][0], "big", "winner must be first (cover)");
         assert_eq!(posts[0].len(), 2);
@@ -1137,11 +1788,11 @@ mod tests {
         let vision = FakeVision {
             replies: HashMap::new(),
             default_idx: 0,
-            calls: RefCell::new(0),
+            calls: Mutex::new(0),
         };
         let mut log = Vec::new();
         run_with(&dups, &stacks, &caption, &write, &vision, args(true), &mut log).unwrap();
-        let locs = write.locations.borrow().clone();
+        let locs = write.locations.lock().unwrap().clone();
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].0, "nogps");
         assert_eq!(locs[0].1, 31.0);
@@ -1161,12 +1812,12 @@ mod tests {
         let vision = FakeVision {
             replies: HashMap::new(),
             default_idx: 0,
-            calls: RefCell::new(0),
+            calls: Mutex::new(0),
         };
         let mut log = Vec::new();
         run_with(&dups, &stacks, &caption, &write, &vision, args(true), &mut log).unwrap();
-        assert!(write.stacks.borrow().is_empty());
-        assert_eq!(*vision.calls.borrow(), 0);
+        assert!(write.stacks.lock().unwrap().is_empty());
+        assert_eq!(*vision.calls.lock().unwrap(), 0);
         let s = String::from_utf8(log).unwrap();
         assert!(s.contains("ContainsVideo"), "{s}");
     }
@@ -1193,11 +1844,11 @@ mod tests {
         let vision = FakeVision {
             replies: HashMap::new(),
             default_idx: 0,
-            calls: RefCell::new(0),
+            calls: Mutex::new(0),
         };
         let mut log = Vec::new();
         run_with(&dups, &stacks, &caption, &write, &vision, args(true), &mut log).unwrap();
-        assert!(write.stacks.borrow().is_empty());
+        assert!(write.stacks.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1217,12 +1868,163 @@ mod tests {
         let vision = FakeVision {
             replies: HashMap::new(),
             default_idx: 1, // winner = b
-            calls: RefCell::new(0),
+            calls: Mutex::new(0),
         };
         let mut log = Vec::new();
         run_with(&dups, &stacks, &caption, &write, &vision, args(true), &mut log).unwrap();
-        assert_eq!(*vision.calls.borrow(), 1);
-        let posts = write.stacks.borrow().clone();
+        assert_eq!(*vision.calls.lock().unwrap(), 1);
+        let posts = write.stacks.lock().unwrap().clone();
         assert_eq!(posts[0][0], "b");
+    }
+
+    #[test]
+    fn run_with_parallel_handles_many_groups() {
+        // 8 size-decidable groups, 4 workers. Verifies the parallel
+        // path doesn't lose work and that the totals add up.
+        let mut groups = Vec::new();
+        for i in 0..8 {
+            groups.push(group(
+                &format!("g{i}"),
+                vec![
+                    with_size(asset(&format!("a{i}"), &format!("/p/a{i}.jpg")), 3_000_000),
+                    with_size(asset(&format!("b{i}"), &format!("/p/b{i}.jpg")), 1_000_000),
+                ],
+            ));
+        }
+        let dups = FakeDuplicates { groups };
+        let stacks = FakeStacks { stacks: vec![] };
+        let caption = FakeCaption;
+        let write = FakeWrite::default();
+        let vision = FakeVision {
+            replies: HashMap::new(),
+            default_idx: 0,
+            calls: Mutex::new(0),
+        };
+        let mut a = args(true);
+        a.parallel = 4;
+        let mut log = Vec::new();
+        run_with(&dups, &stacks, &caption, &write, &vision, a, &mut log).unwrap();
+        // Size short-circuits → no vision calls.
+        assert_eq!(*vision.calls.lock().unwrap(), 0);
+        // Every group produced exactly one stack, winner first.
+        let posts = write.stacks.lock().unwrap().clone();
+        assert_eq!(posts.len(), 8);
+        for ids in &posts {
+            assert_eq!(ids.len(), 2);
+            assert!(ids[0].starts_with('a'), "winner must be the larger 'a' asset, got {:?}", ids);
+        }
+    }
+
+    #[test]
+    fn run_with_apply_auto_deletes_cross_folder_dupes_and_keeps_gps() {
+        // Same basename + same time + same size, two folders, one has
+        // GPS — auto delete must fire, the GPS asset stays, no stack
+        // is created, no vision call is made.
+        let dups = FakeDuplicates {
+            groups: vec![group(
+                "g1",
+                vec![
+                    with_size(asset("plain", "/x/IMG_001.jpg"), 2_000_000),
+                    with_size(with_gps(asset("withgps", "/y/IMG_001.jpg"), 31.0, 121.0), 2_000_000),
+                ],
+            )],
+        };
+        let stacks = FakeStacks { stacks: vec![] };
+        let caption = FakeCaption;
+        let write = FakeWrite::default();
+        let vision = FakeVision {
+            replies: HashMap::new(),
+            default_idx: 0,
+            calls: Mutex::new(0),
+        };
+        let mut log = Vec::new();
+        run_with(&dups, &stacks, &caption, &write, &vision, args(true), &mut log).unwrap();
+
+        let deletes = write.deletes.lock().unwrap().clone();
+        assert_eq!(deletes, vec![vec!["plain".to_string()]]);
+        assert!(write.stacks.lock().unwrap().is_empty());
+        assert_eq!(*vision.calls.lock().unwrap(), 0);
+        let s = String::from_utf8(log).unwrap();
+        assert!(s.contains("AUTO-DELETE"), "{s}");
+    }
+
+    #[test]
+    fn run_with_apply_video_auto_delete_backfills_gps_then_deletes() {
+        // Two videos, same name+time+folders differ, sizes differ.
+        // Keeper is the larger one (b). a has GPS, b doesn't → must
+        // PUT a's coords onto b BEFORE deleting a. No stack, no
+        // vision call.
+        let dups = FakeDuplicates {
+            groups: vec![group(
+                "g1",
+                vec![
+                    with_size(with_gps(video("a", "/x/VID.mp4"), 31.5, 121.5), 5_000_000),
+                    with_size(video("b", "/y/VID.mp4"), 9_000_000),
+                ],
+            )],
+        };
+        let stacks = FakeStacks { stacks: vec![] };
+        let caption = FakeCaption;
+        let write = FakeWrite::default();
+        let vision = FakeVision {
+            replies: HashMap::new(),
+            default_idx: 0,
+            calls: Mutex::new(0),
+        };
+        let mut log = Vec::new();
+        run_with(&dups, &stacks, &caption, &write, &vision, args(true), &mut log).unwrap();
+
+        let locs = write.locations.lock().unwrap().clone();
+        assert_eq!(locs, vec![("b".to_string(), 31.5, 121.5)]);
+        let deletes = write.deletes.lock().unwrap().clone();
+        assert_eq!(deletes, vec![vec!["a".to_string()]]);
+        assert!(write.stacks.lock().unwrap().is_empty());
+        assert_eq!(*vision.calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn run_with_dry_run_does_not_delete_cross_folder_dupes() {
+        let dups = FakeDuplicates {
+            groups: vec![group(
+                "g1",
+                vec![
+                    with_size(asset("a", "/x/IMG.jpg"), 2_000_000),
+                    with_size(asset("b", "/y/IMG.jpg"), 2_000_000),
+                ],
+            )],
+        };
+        let stacks = FakeStacks { stacks: vec![] };
+        let caption = FakeCaption;
+        let write = FakeWrite::default();
+        let vision = FakeVision {
+            replies: HashMap::new(),
+            default_idx: 0,
+            calls: Mutex::new(0),
+        };
+        let mut log = Vec::new();
+        run_with(&dups, &stacks, &caption, &write, &vision, args(false), &mut log).unwrap();
+        assert!(write.deletes.lock().unwrap().is_empty());
+        let s = String::from_utf8(log).unwrap();
+        assert!(s.contains("DRY-RUN AUTO-DELETE"), "{s}");
+    }
+
+    #[test]
+    fn run_with_parallel_rejects_zero() {
+        let dups = FakeDuplicates { groups: vec![] };
+        let stacks = FakeStacks { stacks: vec![] };
+        let caption = FakeCaption;
+        let write = FakeWrite::default();
+        let vision = FakeVision {
+            replies: HashMap::new(),
+            default_idx: 0,
+            calls: Mutex::new(0),
+        };
+        let mut a = args(false);
+        a.parallel = 0;
+        let mut log = Vec::new();
+        let err = run_with(&dups, &stacks, &caption, &write, &vision, a, &mut log)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--parallel"), "got: {err}");
     }
 }

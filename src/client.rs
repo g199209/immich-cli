@@ -68,6 +68,12 @@ pub trait DedupWriteBackend {
     /// first id in the array as the primary (cover) asset, so callers
     /// MUST put the winner first.
     fn create_stack(&self, asset_ids: &[String]) -> Result<Stack>;
+
+    /// `DELETE /api/assets` with `{ids: [...], force: false}`. Goes to
+    /// the trash rather than wiping immediately — even when we're
+    /// confident about an exact cross-folder duplicate, the trash is a
+    /// cheap safety net the user can restore from.
+    fn delete_assets(&self, ids: &[String]) -> Result<()>;
 }
 
 /// Backend the `info` subcommand talks to. Separate from `SearchBackend`
@@ -240,6 +246,26 @@ impl DedupWriteBackend for ImmichClient {
             .with_context(|| format!("HTTP POST {url} failed"))?;
         let raw = unpack_json(resp, &url)?;
         serde_json::from_value(raw).context("failed to decode POST /api/stacks response")
+    }
+
+    fn delete_assets(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let url = format!("{}/api/assets", self.base_url);
+        let body = serde_json::json!({ "ids": ids, "force": false });
+        let resp = self
+            .http
+            .delete(&url)
+            .json(&body)
+            .send()
+            .with_context(|| format!("HTTP DELETE {url} failed"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            bail!("Immich returned {status} for DELETE {url}: {body}");
+        }
+        Ok(())
     }
 }
 
