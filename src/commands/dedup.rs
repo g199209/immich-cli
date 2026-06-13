@@ -3,6 +3,10 @@
 //! Pipeline per `GET /api/duplicates` group:
 //!   1. **Skip** the group if any member is already in some stack
 //!      (avoid double-stacking the same shot).
+//!   1b.**Skip** (keep all members) if every asset has a capture time
+//!      and earliest/latest differ by more than 1 day. Hard guard that
+//!      runs before auto-delete so a multi-day spread can never trigger
+//!      a delete or stack, regardless of `--max-time-gap-secs`.
 //!   2. **Skip** if any member is a video — the user has not asked us
 //!      to make video judgement calls.
 //!   3. **Auto-delete (images)** if every member is an image with the
@@ -70,6 +74,13 @@ const MAX_PICK_TOKENS: u32 = 1024;
 /// must be ≤ this. 0.001 = 0.1% — enough to absorb an EXIF rewrite
 /// without admitting a different export.
 const AUTO_DELETE_MAX_SIZE_GAP: f64 = 0.001;
+
+/// Hard upper bound on the capture-time spread within a duplicate group.
+/// If earliest/latest differ by more than this, we keep every member
+/// untouched regardless of any other rule (no stack, no delete). This
+/// guards against acting on groups that obviously span more than a
+/// single shoot, even when `--max-time-gap-secs` is set very high.
+const HARD_MAX_TIME_SPREAD_SECS: i64 = 86_400;
 
 #[derive(Args, Debug)]
 pub struct DedupArgs {
@@ -242,6 +253,28 @@ pub fn classify_group(
     if group.assets.iter().any(|a| stacked.contains(&a.id)) {
         return GroupDecision::Skip(SkipReason::AlreadyStacked);
     }
+
+    // Hard safety guard: when every asset has a capture time and the
+    // earliest/latest differ by more than HARD_MAX_TIME_SPREAD_SECS,
+    // bail out before any auto-delete branch. A multi-day spread inside
+    // one "duplicate" group is almost always two distinct events the
+    // perceptual hash collided on, and we'd rather preserve them all
+    // than risk a wrong delete or stack.
+    if let Some(times) = group
+        .assets
+        .iter()
+        .map(asset_capture_time_seconds)
+        .collect::<Option<Vec<i64>>>()
+    {
+        let (min_t, max_t) = (
+            *times.iter().min().unwrap(),
+            *times.iter().max().unwrap(),
+        );
+        if max_t - min_t > HARD_MAX_TIME_SPREAD_SECS {
+            return GroupDecision::Skip(SkipReason::TimeGapTooLarge);
+        }
+    }
+
     let folders: HashSet<&str> = group
         .assets
         .iter()
@@ -1208,6 +1241,42 @@ mod tests {
             vec![
                 with_time(asset("a", "/p/a.jpg"), "2024-03-12T17:08:42"),
                 with_time(asset("b", "/p/b.jpg"), "2024-03-12T17:30:00"),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
+        assert_eq!(dec, GroupDecision::Skip(SkipReason::TimeGapTooLarge));
+    }
+
+    #[test]
+    fn classify_skip_when_time_spread_exceeds_one_day() {
+        // > 24h spread: keep all, regardless of an over-permissive
+        // --max-time-gap-secs.
+        let g = group(
+            "g",
+            vec![
+                with_time(asset("a", "/p/a.jpg"), "2024-03-12T17:00:00"),
+                with_time(asset("b", "/p/b.jpg"), "2024-03-13T17:00:01"),
+            ],
+        );
+        let dec = classify_group(&g, &HashSet::new(), i64::MAX, 500.0);
+        assert_eq!(dec, GroupDecision::Skip(SkipReason::TimeGapTooLarge));
+    }
+
+    #[test]
+    fn classify_one_day_guard_blocks_auto_delete() {
+        // Cross-folder same-name+same-size would normally auto-delete,
+        // but with a > 1-day capture-time spread we must keep both.
+        let g = group(
+            "g",
+            vec![
+                with_time(
+                    with_size(asset("a", "/x/IMG_1.jpg"), 2_000_000),
+                    "2024-03-12T17:00:00",
+                ),
+                with_time(
+                    with_size(asset("b", "/y/IMG_1.jpg"), 2_000_000),
+                    "2024-03-14T17:00:00",
+                ),
             ],
         );
         let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
