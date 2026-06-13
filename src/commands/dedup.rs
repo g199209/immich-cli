@@ -3,10 +3,14 @@
 //! Pipeline per `GET /api/duplicates` group:
 //!   1. **Skip** the group if any member is already in some stack
 //!      (avoid double-stacking the same shot).
-//!   1b.**Skip** (keep all members) if every asset has a capture time
-//!      and earliest/latest differ by more than 1 day. Hard guard that
-//!      runs before auto-delete so a multi-day spread can never trigger
-//!      a delete or stack, regardless of `--max-time-gap-secs`.
+//!   1b.**KeepAll** if every asset has a capture time and earliest/latest
+//!      differ by more than 6 hours. Hard guard that runs before
+//!      auto-delete so a multi-hour spread can never trigger a delete
+//!      or stack. In `--apply` mode this calls
+//!      `DELETE /api/duplicates/{id}` to dismiss the group server-side
+//!      so it no longer appears under `GET /api/duplicates` (same
+//!      effect as the web UI's "keep all"). Assets themselves are
+//!      untouched.
 //!   2. **Skip** if any member is a video — the user has not asked us
 //!      to make video judgement calls.
 //!   3. **Auto-delete (images)** if every member is an image with the
@@ -33,7 +37,9 @@
 //!      cross-folder match that isn't an exact-name+time duplicate is
 //!      almost always a coincidence we don't want to act on.
 //!   5. **Skip** if earliest/latest capture time differ by more than
-//!      `--max-time-gap` (default 10 min).
+//!      `--max-time-gap` (default 10 min). Combined with rule 1b: a
+//!      10min–6h spread falls through here, while > 6h is hard-capped
+//!      earlier and can't reach the auto-delete branches at all.
 //!   6. **Skip** if ALL members have GPS and the pairwise great-circle
 //!      distance exceeds `--max-distance-m` (default 500m). When some
 //!      members are missing GPS we keep the group and copy coords later.
@@ -80,7 +86,7 @@ const AUTO_DELETE_MAX_SIZE_GAP: f64 = 0.001;
 /// untouched regardless of any other rule (no stack, no delete). This
 /// guards against acting on groups that obviously span more than a
 /// single shoot, even when `--max-time-gap-secs` is set very high.
-const HARD_MAX_TIME_SPREAD_SECS: i64 = 86_400;
+const HARD_MAX_TIME_SPREAD_SECS: i64 = 6 * 60 * 60;
 
 #[derive(Args, Debug)]
 pub struct DedupArgs {
@@ -91,7 +97,9 @@ pub struct DedupArgs {
 
     /// Maximum capture-time gap, in seconds, between the earliest and
     /// latest asset in a duplicate group. Groups exceeding this are
-    /// skipped as likely false positives.
+    /// skipped as likely false positives. Note: rule 1b applies a
+    /// separate hard 6h cap that runs before auto-delete and cannot
+    /// be relaxed by raising this value.
     #[arg(long, default_value_t = 600)]
     pub max_time_gap_secs: i64,
 
@@ -155,6 +163,13 @@ pub enum GroupDecision {
         keeper_idx: usize,
         gps_backfill: Option<(f64, f64)>,
     },
+    /// Hard time-spread guard (> 6h) fired. Don't delete or stack — but
+    /// don't just silently skip either, otherwise the same group keeps
+    /// showing up on every `GET /api/duplicates`. In `--apply` mode we
+    /// PUT `duplicateId: null` on every member to detach them from the
+    /// duplicate group on the server side (the same effect as the
+    /// web UI's "keep all" button).
+    KeepAll,
     /// Pre-filter accepted the group; the winner still needs to be
     /// picked by [`pick_winner_by_size`] or the vision model.
     Consider,
@@ -256,10 +271,11 @@ pub fn classify_group(
 
     // Hard safety guard: when every asset has a capture time and the
     // earliest/latest differ by more than HARD_MAX_TIME_SPREAD_SECS,
-    // bail out before any auto-delete branch. A multi-day spread inside
+    // bail out before any auto-delete branch. A multi-hour spread inside
     // one "duplicate" group is almost always two distinct events the
-    // perceptual hash collided on, and we'd rather preserve them all
-    // than risk a wrong delete or stack.
+    // perceptual hash collided on, so we KeepAll — preserving every
+    // asset AND detaching them from the duplicate group on the server
+    // so they stop reappearing on future runs.
     if let Some(times) = group
         .assets
         .iter()
@@ -271,7 +287,7 @@ pub fn classify_group(
             *times.iter().max().unwrap(),
         );
         if max_t - min_t > HARD_MAX_TIME_SPREAD_SECS {
-            return GroupDecision::Skip(SkipReason::TimeGapTooLarge);
+            return GroupDecision::KeepAll;
         }
     }
 
@@ -696,6 +712,7 @@ where
     let mut counts = Counts::default();
     let mut to_process: Vec<&DuplicateGroup> = Vec::new();
     let mut to_auto_delete: Vec<(&DuplicateGroup, usize, Option<(f64, f64)>)> = Vec::new();
+    let mut to_keep_all: Vec<&DuplicateGroup> = Vec::new();
     for group in &groups {
         match classify_group(group, &stacked, args.max_time_gap_secs, args.max_distance_m) {
             GroupDecision::Skip(reason) => {
@@ -707,6 +724,7 @@ where
             GroupDecision::AutoDeleteDupes { keeper_idx, gps_backfill } => {
                 to_auto_delete.push((group, keeper_idx, gps_backfill));
             }
+            GroupDecision::KeepAll => to_keep_all.push(group),
             GroupDecision::Consider => to_process.push(group),
         }
     }
@@ -721,6 +739,11 @@ where
     // work per group is a single DELETE, parallelism wouldn't help.
     let auto_del = run_auto_deletes(write_be, &to_auto_delete, args.apply, log);
     counts.merge_auto_delete(&auto_del);
+
+    // Phase 2a' — detach KeepAll groups from their server-side duplicate
+    // grouping so they stop reappearing. Pure PUT, no GPS/stack work.
+    let keep = run_keep_all(write_be, &to_keep_all, args.apply, log);
+    counts.merge_keep_all(&keep);
 
     // Phase 2b — plan + apply, parallelized across groups. Each worker
     // does N thumbnail fetches + 1 vision call + (in --apply mode) M
@@ -766,6 +789,23 @@ fn log_skip<W: std::io::Write>(
             )?;
         }
     }
+    if *reason == SkipReason::TimeGapTooLarge {
+        // Print earliest/latest and per-asset capture-time strings so
+        // the user can tell which tier of the time guard they hit (the
+        // 10-min user rule vs. the hard 6h cap) and spot wildly wrong
+        // EXIF values.
+        for a in &group.assets {
+            writeln!(
+                log,
+                "  asset {} path={} dateTimeOriginal={:?} localDateTime={:?} fileCreatedAt={:?}",
+                a.id,
+                a.original_path,
+                a.exif_info.as_ref().and_then(|e| e.date_time_original.as_deref()),
+                a.local_date_time.as_deref(),
+                a.file_created_at.as_deref(),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -778,6 +818,17 @@ struct AutoDeleteCounts {
     deleted_groups: u32,
     deleted_assets: u32,
     delete_failed: u32,
+}
+
+/// Counters for the KeepAll phase (groups beyond the 6h hard cap whose
+/// `duplicateId` we detach on the server).
+#[derive(Default)]
+struct KeepAllCounts {
+    would_keep_groups: u32,
+    would_keep_assets: u32,
+    kept_groups: u32,
+    kept_assets: u32,
+    keep_failed: u32,
 }
 
 /// Execute (or, in dry-run, log) the auto-delete decisions for exact
@@ -861,6 +912,57 @@ where
                 writeln!(
                     log,
                     "FAIL delete group {} — {e:#}",
+                    group.duplicate_id
+                )
+                .ok();
+            }
+        }
+    }
+    counts
+}
+
+/// Execute (or, in dry-run, log) the KeepAll decisions. Each group is
+/// dismissed server-side via `DELETE /api/duplicates/{id}` so its
+/// members stop appearing in `GET /api/duplicates`. Errors on
+/// individual groups are logged but do not abort the run.
+fn run_keep_all<W, Log>(
+    write_be: &W,
+    groups: &[&DuplicateGroup],
+    apply: bool,
+    log: &mut Log,
+) -> KeepAllCounts
+where
+    W: DedupWriteBackend,
+    Log: std::io::Write,
+{
+    let mut counts = KeepAllCounts::default();
+    let prefix = if apply { "KEEP-ALL" } else { "DRY-RUN KEEP-ALL" };
+    for group in groups {
+        let n_assets = group.assets.len() as u32;
+        writeln!(
+            log,
+            "{prefix} group {} ({} assets) — capture-time spread > 6h, dismissing on server",
+            group.duplicate_id, n_assets,
+        )
+        .ok();
+        for a in &group.assets {
+            writeln!(log, "  {prefix} {} {}", a.id, a.original_path).ok();
+        }
+        if !apply {
+            counts.would_keep_groups += 1;
+            counts.would_keep_assets += n_assets;
+            continue;
+        }
+        match write_be.dismiss_duplicate_group(&group.duplicate_id) {
+            Ok(()) => {
+                counts.kept_groups += 1;
+                counts.kept_assets += n_assets;
+            }
+            Err(e) => {
+                counts.keep_failed += 1;
+                writeln!(
+                    log,
+                    "FAIL keep-all group {} — {e:#}",
                     group.duplicate_id
                 )
                 .ok();
@@ -1044,6 +1146,11 @@ struct Counts {
     deleted_groups: u32,
     deleted_assets: u32,
     delete_failed: u32,
+    would_keep_groups: u32,
+    would_keep_assets: u32,
+    kept_groups: u32,
+    kept_assets: u32,
+    keep_failed: u32,
 }
 
 impl Counts {
@@ -1075,6 +1182,14 @@ impl Counts {
         self.delete_failed += d.delete_failed;
     }
 
+    fn merge_keep_all(&mut self, k: &KeepAllCounts) {
+        self.would_keep_groups += k.would_keep_groups;
+        self.would_keep_assets += k.would_keep_assets;
+        self.kept_groups += k.kept_groups;
+        self.kept_assets += k.kept_assets;
+        self.keep_failed += k.keep_failed;
+    }
+
     fn write_summary<W: std::io::Write>(
         &self,
         log: &mut W,
@@ -1099,6 +1214,11 @@ impl Counts {
             )?;
             writeln!(
                 log,
+                "kept-all (>6h spread): {} group(s), {} asset(s); {} failed",
+                self.kept_groups, self.kept_assets, self.keep_failed,
+            )?;
+            writeln!(
+                log,
                 "applied: {} ok, {} ok-with-warnings, {} stack failed, {} plan failed",
                 self.applied, self.applied_with_warnings, self.apply_failed, self.plan_failed,
             )?;
@@ -1107,6 +1227,11 @@ impl Counts {
                 log,
                 "would auto-delete: {} group(s), {} asset(s)",
                 self.would_delete_groups, self.would_delete_assets,
+            )?;
+            writeln!(
+                log,
+                "would keep-all (>6h spread): {} group(s), {} asset(s)",
+                self.would_keep_groups, self.would_keep_assets,
             )?;
             writeln!(
                 log,
@@ -1248,39 +1373,39 @@ mod tests {
     }
 
     #[test]
-    fn classify_skip_when_time_spread_exceeds_one_day() {
-        // > 24h spread: keep all, regardless of an over-permissive
-        // --max-time-gap-secs.
+    fn classify_keep_all_when_time_spread_exceeds_six_hours() {
+        // > 6h spread: KeepAll so the runner detaches duplicateId on
+        // the server, regardless of an over-permissive --max-time-gap-secs.
         let g = group(
             "g",
             vec![
-                with_time(asset("a", "/p/a.jpg"), "2024-03-12T17:00:00"),
-                with_time(asset("b", "/p/b.jpg"), "2024-03-13T17:00:01"),
+                with_time(asset("a", "/p/a.jpg"), "2024-03-12T10:00:00"),
+                with_time(asset("b", "/p/b.jpg"), "2024-03-12T16:00:01"),
             ],
         );
         let dec = classify_group(&g, &HashSet::new(), i64::MAX, 500.0);
-        assert_eq!(dec, GroupDecision::Skip(SkipReason::TimeGapTooLarge));
+        assert_eq!(dec, GroupDecision::KeepAll);
     }
 
     #[test]
-    fn classify_one_day_guard_blocks_auto_delete() {
+    fn classify_six_hour_guard_blocks_auto_delete() {
         // Cross-folder same-name+same-size would normally auto-delete,
-        // but with a > 1-day capture-time spread we must keep both.
+        // but with a > 6h capture-time spread we KeepAll instead.
         let g = group(
             "g",
             vec![
                 with_time(
                     with_size(asset("a", "/x/IMG_1.jpg"), 2_000_000),
-                    "2024-03-12T17:00:00",
+                    "2024-03-12T10:00:00",
                 ),
                 with_time(
                     with_size(asset("b", "/y/IMG_1.jpg"), 2_000_000),
-                    "2024-03-14T17:00:00",
+                    "2024-03-12T17:00:00",
                 ),
             ],
         );
         let dec = classify_group(&g, &HashSet::new(), 600, 500.0);
-        assert_eq!(dec, GroupDecision::Skip(SkipReason::TimeGapTooLarge));
+        assert_eq!(dec, GroupDecision::KeepAll);
     }
 
     #[test]
@@ -1714,6 +1839,7 @@ mod tests {
         locations: Mutex<Vec<(String, f64, f64)>>,
         stacks: Mutex<Vec<Vec<String>>>,
         deletes: Mutex<Vec<Vec<String>>>,
+        dismissed_groups: Mutex<Vec<String>>,
     }
     impl DedupWriteBackend for FakeWrite {
         fn update_asset_location(
@@ -1740,6 +1866,13 @@ mod tests {
         }
         fn delete_assets(&self, ids: &[String]) -> Result<()> {
             self.deletes.lock().unwrap().push(ids.to_vec());
+            Ok(())
+        }
+        fn dismiss_duplicate_group(&self, duplicate_id: &str) -> Result<()> {
+            self.dismissed_groups
+                .lock()
+                .unwrap()
+                .push(duplicate_id.into());
             Ok(())
         }
     }
@@ -2075,6 +2208,66 @@ mod tests {
         assert!(write.deletes.lock().unwrap().is_empty());
         let s = String::from_utf8(log).unwrap();
         assert!(s.contains("DRY-RUN AUTO-DELETE"), "{s}");
+    }
+
+    #[test]
+    fn run_with_apply_dismisses_duplicate_group_for_keep_all() {
+        // > 6h spread → KeepAll. In --apply mode we must DELETE
+        // /api/duplicates/{group_id}; no asset delete, no stack, no
+        // vision call.
+        let dups = FakeDuplicates {
+            groups: vec![group(
+                "g1",
+                vec![
+                    with_time(asset("a", "/p/a.jpg"), "2024-03-12T10:00:00"),
+                    with_time(asset("b", "/p/b.jpg"), "2024-03-12T17:00:00"),
+                ],
+            )],
+        };
+        let stacks = FakeStacks { stacks: vec![] };
+        let caption = FakeCaption;
+        let write = FakeWrite::default();
+        let vision = FakeVision {
+            replies: HashMap::new(),
+            default_idx: 0,
+            calls: Mutex::new(0),
+        };
+        let mut log = Vec::new();
+        run_with(&dups, &stacks, &caption, &write, &vision, args(true), &mut log).unwrap();
+
+        let dismissed = write.dismissed_groups.lock().unwrap().clone();
+        assert_eq!(dismissed, vec!["g1".to_string()]);
+        assert!(write.deletes.lock().unwrap().is_empty());
+        assert!(write.stacks.lock().unwrap().is_empty());
+        assert_eq!(*vision.calls.lock().unwrap(), 0);
+        let s = String::from_utf8(log).unwrap();
+        assert!(s.contains("KEEP-ALL"), "{s}");
+    }
+
+    #[test]
+    fn run_with_dry_run_does_not_dismiss_duplicate_group_for_keep_all() {
+        let dups = FakeDuplicates {
+            groups: vec![group(
+                "g1",
+                vec![
+                    with_time(asset("a", "/p/a.jpg"), "2024-03-12T10:00:00"),
+                    with_time(asset("b", "/p/b.jpg"), "2024-03-12T17:00:00"),
+                ],
+            )],
+        };
+        let stacks = FakeStacks { stacks: vec![] };
+        let caption = FakeCaption;
+        let write = FakeWrite::default();
+        let vision = FakeVision {
+            replies: HashMap::new(),
+            default_idx: 0,
+            calls: Mutex::new(0),
+        };
+        let mut log = Vec::new();
+        run_with(&dups, &stacks, &caption, &write, &vision, args(false), &mut log).unwrap();
+        assert!(write.dismissed_groups.lock().unwrap().is_empty());
+        let s = String::from_utf8(log).unwrap();
+        assert!(s.contains("DRY-RUN KEEP-ALL"), "{s}");
     }
 
     #[test]

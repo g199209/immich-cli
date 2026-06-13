@@ -74,6 +74,14 @@ pub trait DedupWriteBackend {
     /// confident about an exact cross-folder duplicate, the trash is a
     /// cheap safety net the user can restore from.
     fn delete_assets(&self, ids: &[String]) -> Result<()>;
+
+    /// `DELETE /api/duplicates/{id}` — "dismiss" a duplicate group by
+    /// its `duplicateId`. Per the OpenAPI spec this "unlinks all assets
+    /// in the group without deleting them", i.e. the pixels are
+    /// untouched and the group stops appearing under
+    /// `GET /api/duplicates`. Same effect as the web UI's "keep all".
+    /// Needs the `duplicate.delete` permission on the API key.
+    fn dismiss_duplicate_group(&self, duplicate_id: &str) -> Result<()>;
 }
 
 /// Backend the `info` subcommand talks to. Separate from `SearchBackend`
@@ -258,6 +266,21 @@ impl DedupWriteBackend for ImmichClient {
             .http
             .delete(&url)
             .json(&body)
+            .send()
+            .with_context(|| format!("HTTP DELETE {url} failed"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            bail!("Immich returned {status} for DELETE {url}: {body}");
+        }
+        Ok(())
+    }
+
+    fn dismiss_duplicate_group(&self, duplicate_id: &str) -> Result<()> {
+        let url = format!("{}/api/duplicates/{duplicate_id}", self.base_url);
+        let resp = self
+            .http
+            .delete(&url)
             .send()
             .with_context(|| format!("HTTP DELETE {url} failed"))?;
         let status = resp.status();
