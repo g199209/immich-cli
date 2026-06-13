@@ -248,13 +248,19 @@ admin2 name; `(uncategorized)` holds cities with no joined admin2):\n\n\
 {VOCAB}\n\n\
 Output strict JSON, no prose:\n\
 {\"matches\": [{\"country\": \"...\", \"state\": \"...\", \"city\": \"...\"}, ...]}\n\n\
-CORE PRINCIPLE — match the user's precision, not coarser, not finer.\n\
-The level of detail in the output (country only / country+state / country+state+city) must \
-match the level the user actually targeted. NEVER \"fall back to a broader level\" if a finer \
-match isn't possible — broadening returns photos from places the user did NOT ask about. If \
-you cannot identify the user's place at the precision they specified, return \
-{\"matches\": []}. Empty is the correct answer when there is no overlap; do not substitute a \
-neighbouring or enclosing region.\n\n\
+CORE PRINCIPLE — match the user's precision when you can, broaden when you can't; never \
+return empty for a real place.\n\
+The level of detail in the output (country only / country+state / country+state+city) should \
+normally match the level the user actually targeted — don't enumerate every city when the \
+user asked for a whole state, and don't substitute a single neighbouring city when they \
+asked for a county. BUT empty matches are NOT an acceptable answer when the user's input \
+names a real place. If you cannot identify the region at the precision the user specified, \
+BROADEN one level at a time — specific cities → state-only → country-only — and emit the \
+narrowest broadened match that overlaps the vocabulary. The user typed a place name; they \
+expect photos from somewhere related, and a state-only or country-only fall-back is far \
+better than zero results. Return {\"matches\": []} ONLY when the user's input names nowhere \
+inside any country in the vocabulary at all (e.g., `Antarctica` when no Antarctic country \
+exists in the vocabulary).\n\n\
 How to pick the level:\n\
 - User names a COUNTRY (`日本`, `Japan`, `中国`, `US`) → one match, only `country` set. Do NOT \
 list every state.\n\
@@ -271,11 +277,18 @@ fields.\n\
 (an alias / Chinese name / informal name like `三亚` for `三亚市`, `海淀` for `Haidian Qu`, \
 `Shibuya` for `Shibuya-ku`). Same as the admin2 case — return every city under the matched \
 admin2.\n\
-- User names a sub-state region with NO matching admin2 in the vocabulary — only then fall \
-back on your geographic knowledge of which `(uncategorized)` cities lie inside it. Do NOT \
-enumerate cities from OTHER admin2s of the same state; that would broaden the result.\n\
-- If after all the above you cannot identify ANY vocabulary city as inside the user's \
-region, return {\"matches\": []}. Empty is the correct answer when there is no overlap.\n\n\
+- User names a sub-state region with NO matching admin2 in the vocabulary (a scenic spot, a \
+small island, a township not surfaced as a city, an obscure neighbourhood) — first try the \
+`(uncategorized)` cities of that state using your geographic knowledge. If NONE of the \
+`(uncategorized)` cities are inside the user's region, fall back to a single state-only \
+match `{\"country\": \"...\", \"state\": \"<enclosing state>\"}`. Do NOT enumerate cities \
+from OTHER admin2s of the same state — broaden to the whole state instead, it's the cleaner \
+broadening.\n\
+- The user's region is inside a country that is in the vocabulary but no vocabulary state \
+covers it (or you cannot reliably identify the enclosing state) → fall back to a single \
+country-only match `{\"country\": \"<enclosing country>\"}`.\n\
+- ONLY if the user's input names nowhere inside any vocabulary country at all → return \
+{\"matches\": []}.\n\n\
 Return MULTIPLE matches when (a) the user's sub-state region contains multiple vocabulary \
 cities (the common case for any prefecture / district / county / metro area), or (b) the \
 same city name appears under multiple states.\n\n\
@@ -285,9 +298,13 @@ vocabulary):\n\
 - A vocabulary state → {\"country\": \"...\", \"state\": \"<state name>\"}. Do NOT enumerate \
 its cities.\n\
 - A vocabulary city → {\"country\": \"...\", \"state\": \"...\", \"city\": \"<city name>\"}.\n\
-- A sub-state region (district / prefecture / county / neighbourhood) → one match per \
-vocabulary city you can identify as lying inside that region, possibly several.\n\
-- A region that has no overlap with the vocabulary → {\"matches\": []}.\n\n\
+- A sub-state region with identifiable vocabulary cities inside it → one match per city.\n\
+- A sub-state region inside a vocabulary state but with NO identifiable vocabulary cities → \
+fall back to a single state-level match {\"country\": \"...\", \"state\": \"<enclosing \
+state>\"}. A broader match is BETTER than empty.\n\
+- A region inside a vocabulary country but with no enclosing vocabulary state → fall back to \
+{\"country\": \"<enclosing country>\"}.\n\
+- A region in no vocabulary country at all → {\"matches\": []}.\n\n\
 FORMAT: omit `state` and `city` entirely when they are not used — do NOT include them as empty \
 strings. `{\"country\": \"...\", \"state\": \"Hainan\"}` is correct; \
 `{\"country\": \"...\", \"state\": \"Hainan\", \"city\": \"\"}` is WRONG (the library would \

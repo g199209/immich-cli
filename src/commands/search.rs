@@ -590,7 +590,7 @@ where
         }
     }
 
-    let truncated = any_truncated || (assets.len() >= limit && enriched.len() > limit);
+    let truncated = assets.len() >= limit && (any_truncated || enriched.len() > limit);
     if args.verbose {
         eprintln!(
             "[verbose] search: returning {} asset(s){}",
