@@ -3,36 +3,36 @@
 //! Used by `search` when an `-q` query is paired with a configured
 //! `[llm]` block. Main responsibilities:
 //!   1. **Keyword expansion**: LLM turns the natural-language query into
-//!      up to 8 Chinese substrings that are likely to appear verbatim
+//!      up to 3 Chinese substrings that are likely to appear verbatim
 //!      inside a photo description.
 //!   2. **Substring search**: each keyword is fanned out against
 //!      `/api/search/metadata` with the same hard filters the user
 //!      passed to `search` (city, country, taken-after, …). Each keyword
-//!      contributes up to 64 candidates, then all candidates are unioned
-//!      and deduped by asset id.
-//!   3. **Rerank**: the LLM is shown the query and enriched candidates
-//!      (short id, metadata, sources, matched keywords, description) and
-//!      returns the relevant short ids in relevance order.
+//!      contributes up to a per-keyword cap, then all candidates are
+//!      unioned and deduped by asset id.
+//!   3. **Rerank**: the vision LLM is shown the query, per-candidate
+//!      metadata (short id, time, place, people, sources, matched
+//!      keywords) and the candidate thumbnails, and returns the relevant
+//!      short ids in relevance order. The thumbnail replaces what the
+//!      old text-only path used to send as a description excerpt — the
+//!      vision model can read appearance straight from pixels, which is
+//!      cheaper *and* more accurate than routing through another model's
+//!      generated caption.
 
 use crate::client::SearchBackend;
-use crate::llm::{ChatBackend, Message};
+use crate::llm::{ChatBackend, Message, MultiImageVisionLlm};
 use crate::models::{Asset, SearchRequest};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// Hard upper bound on keywords returned by the LLM. Keeps prompt cost
-/// linear and the substring-search fan-out bounded.
-pub const MAX_KEYWORDS: usize = 8;
-
-/// Per-keyword cap before deduping candidates for rerank. Keeping this
-/// per keyword avoids one broad keyword filling the entire rerank pool
-/// and starving later, more specific keywords.
-pub const MAX_CANDIDATES_PER_KEYWORD: usize = 64;
-
-/// Per-candidate description excerpt sent to the reranker. Long enough
-/// to convey content, short enough to keep the rerank prompt bounded.
-pub const DESCRIPTION_EXCERPT_CHARS: usize = 1500;
+/// Hard upper bound on keywords returned by the LLM. Each keyword
+/// triggers one sequential Immich `/metadata` round-trip, so this is
+/// the dominant lever on description fan-out latency. Three covers
+/// the central noun plus two close synonyms (夕阳 vs 日落, 夜景 vs
+/// 灯光) — broader queries gain little from additional variants and
+/// pay a full RTT for each.
+pub const MAX_KEYWORDS: usize = 3;
 
 /// Same hard filters `search` accepts; we forward them to both the CLIP
 /// path and the per-keyword metadata calls so the two ranked lists are
@@ -69,7 +69,7 @@ Chinese before extracting keywords, regardless of the query language.\n\n\
 Your output MUST be a single JSON object of the form: \
 {\"keywords\": [\"...\", \"...\"]}\n\n\
 Rules:\n\
-- Up to 8 keywords. Quality > quantity.\n\
+- Up to 3 keywords. Quality > quantity.\n\
 - Output keywords in Chinese (e.g. sunset → 夕阳/日落, elephant → 大象, \
 sailing boat → 帆船, savannah → 草原).\n\
 - Each keyword is a short noun phrase (1-8 Chinese characters) likely to \
@@ -129,33 +129,6 @@ pub fn expand_keywords<L: ChatBackend>(
 
 // ---- stage 2: substring search per keyword (with hard filters) ----------
 
-pub fn collect_candidates<S: SearchBackend>(
-    search: &S,
-    keywords: &[String],
-    filters: &HardFilters,
-) -> Result<Vec<Asset>> {
-    let hits = collect_keyword_hits(
-        search,
-        keywords,
-        filters,
-        MAX_CANDIDATES_PER_KEYWORD as u32,
-        false,
-    )?;
-    let mut by_id: HashMap<String, Asset> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
-    for hit in hits {
-        if !by_id.contains_key(&hit.asset.id) {
-            order.push(hit.asset.id.clone());
-            by_id.insert(hit.asset.id.clone(), hit.asset);
-        }
-    }
-
-    Ok(order
-        .into_iter()
-        .filter_map(|id| by_id.remove(&id))
-        .collect())
-}
-
 #[derive(Debug, Clone)]
 pub struct KeywordHit {
     pub keyword: String,
@@ -208,7 +181,7 @@ pub fn collect_keyword_hits<S: SearchBackend>(
     Ok(hits)
 }
 
-// ---- stage 3: rerank -----------------------------------------------------
+// ---- stage 3: vision rerank ----------------------------------------------
 
 #[derive(Deserialize)]
 struct RerankReply {
@@ -217,16 +190,26 @@ struct RerankReply {
 }
 
 const RERANK_SYSTEM_PROMPT: &str = "\
-You are ranking image-search candidates. Given a user query and a list of \
-candidate photos, identify the candidates that genuinely match the user's \
-intent and order them by relevance.\n\n\
+You are ranking image-search candidates. You receive a user query and a list \
+of candidate photos — each candidate is presented as a one-line metadata \
+header followed by the photo itself. Use both the visual content of the \
+photo and the metadata (time, place, people, matched description keywords) \
+to identify candidates that genuinely match the user's intent, ordered by \
+relevance.\n\n\
 Your output MUST be a single JSON object: {\"ids\": [\"id1\", \"id2\", ...]} \
 ordered by descending relevance.\n\n\
 Rules:\n\
-- Be strict. Omit weak or tangential matches.\n\
+- Be strict. Omit weak or tangential matches; visual mismatch with the query \
+trumps a description-keyword hit.\n\
 - Only include candidate ids you actually saw in the input.\n\
 - Return no more ids than the requested limit.\n\
 - If nothing matches, return {\"ids\": []}.";
+
+/// Cap on output tokens for the rerank reply. The reply is just an id
+/// list — even 64 short ids fit comfortably under a few hundred tokens.
+/// Headroom for reasoning models that emit internal thinking before the
+/// JSON, which would otherwise null out `content`.
+const RERANK_MAX_OUTPUT_TOKENS: u32 = 4096;
 
 #[derive(Debug, Clone)]
 pub struct RerankCandidate {
@@ -237,7 +220,6 @@ pub struct RerankCandidate {
     pub people: Vec<String>,
     pub sources: Vec<String>,
     pub matched_keywords: Vec<String>,
-    pub description: String,
 }
 
 #[derive(Debug, Clone)]
@@ -248,54 +230,85 @@ pub struct RerankLocation {
     pub city: Option<String>,
 }
 
-pub fn rerank_rich<L: ChatBackend>(
-    llm: &L,
+/// One-line, human-friendly label sent right before each candidate
+/// thumbnail. Compact on purpose — every char is a vision input token.
+pub fn label_for(c: &RerankCandidate) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(6);
+    parts.push(format!("id={}", c.id));
+    parts.push(format!("type={}", c.asset_type));
+    if let Some(t) = c.taken_at.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("taken={t}"));
+    }
+    if let Some(loc) = &c.location {
+        let mut bits: Vec<&str> = Vec::with_capacity(4);
+        for f in [&loc.country, &loc.state, &loc.admin2, &loc.city]
+            .into_iter()
+            .flatten()
+        {
+            if !f.is_empty() {
+                bits.push(f);
+            }
+        }
+        if !bits.is_empty() {
+            parts.push(format!("loc={}", bits.join("/")));
+        }
+    }
+    if !c.people.is_empty() {
+        parts.push(format!("people={}", c.people.join(",")));
+    }
+    if !c.sources.is_empty() {
+        parts.push(format!("sources={}", c.sources.join("+")));
+    }
+    if !c.matched_keywords.is_empty() {
+        parts.push(format!("matched={}", c.matched_keywords.join(",")));
+    }
+    parts.join(" | ")
+}
+
+/// Vision rerank: each candidate is a `(metadata-label, thumbnail JPEG)`
+/// pair, sent to the multimodal model alongside the query.
+pub fn rerank_rich_vision<V: MultiImageVisionLlm>(
+    llm: &V,
     query: &str,
     limit: usize,
     candidates: &[RerankCandidate],
+    thumbnails: &[Vec<u8>],
     verbose: bool,
 ) -> Result<Vec<String>> {
-    let items: Vec<serde_json::Value> = candidates
-        .iter()
-        .map(|c| {
-            serde_json::json!({
-                "id": c.id,
-                "type": c.asset_type,
-                "takenAt": c.taken_at,
-                "location": c.location.as_ref().map(|loc| serde_json::json!({
-                    "country": loc.country,
-                    "state": loc.state,
-                    "admin2": loc.admin2,
-                    "city": loc.city,
-                })),
-                "people": c.people,
-                "sources": c.sources,
-                "matchedKeywords": c.matched_keywords,
-                "description": excerpt(&c.description, DESCRIPTION_EXCERPT_CHARS),
-            })
-        })
-        .collect();
-    let user_msg = serde_json::json!({
-        "query": query,
-        "limit": limit,
-        "candidates": items,
-    });
-    let user_payload = user_msg.to_string();
-    if verbose {
-        eprintln!(
-            "[verbose] description_search: rerank query={query:?} limit={limit} \
-             candidates={} (user payload = {} chars)",
+    if candidates.len() != thumbnails.len() {
+        anyhow::bail!(
+            "rerank_rich_vision: {} candidate(s) but {} thumbnail(s)",
             candidates.len(),
-            user_payload.len()
+            thumbnails.len()
         );
     }
-    let messages = [
-        Message::system(RERANK_SYSTEM_PROMPT),
-        Message::user(user_payload),
-    ];
-    let raw = llm.chat_json(&messages)?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let items: Vec<(String, Vec<u8>, &str)> = candidates
+        .iter()
+        .zip(thumbnails.iter())
+        .map(|(c, bytes)| (label_for(c), bytes.clone(), "image/jpeg"))
+        .collect();
+    let user_prompt = format!(
+        "query: {query}\nlimit: {limit}\nReturn the top candidate ids by relevance."
+    );
     if verbose {
-        eprintln!("[verbose] description_search: rerank raw LLM reply = {raw}");
+        let label_chars: usize = items.iter().map(|(l, _, _)| l.chars().count()).sum();
+        eprintln!(
+            "[verbose] description_search: vision rerank query={query:?} limit={limit} \
+             candidates={} (labels total {label_chars} chars)",
+            candidates.len()
+        );
+    }
+    let raw = llm.rank_images(
+        RERANK_SYSTEM_PROMPT,
+        &user_prompt,
+        &items,
+        RERANK_MAX_OUTPUT_TOKENS,
+    )?;
+    if verbose {
+        eprintln!("[verbose] description_search: vision rerank raw LLM reply = {raw}");
     }
     let reply: RerankReply = serde_json::from_str(&raw)
         .with_context(|| format!("LLM rerank reply was not valid JSON: {raw}"))?;
@@ -303,7 +316,7 @@ pub fn rerank_rich<L: ChatBackend>(
     ids.truncate(limit);
     if verbose {
         eprintln!(
-            "[verbose] description_search: rerank kept {} id(s) after limit: [{}]",
+            "[verbose] description_search: vision rerank kept {} id(s) after limit: [{}]",
             ids.len(),
             ids.iter()
                 .map(|s| s.as_str())
@@ -314,66 +327,7 @@ pub fn rerank_rich<L: ChatBackend>(
     Ok(ids)
 }
 
-pub fn rerank<L: ChatBackend>(llm: &L, query: &str, candidates: &[Asset]) -> Result<Vec<String>> {
-    let items: Vec<serde_json::Value> = candidates
-        .iter()
-        .map(|a| {
-            serde_json::json!({
-                "id": a.id,
-                "description": excerpt(
-                    a.exif_info
-                        .as_ref()
-                        .and_then(|e| e.description.as_deref())
-                        .unwrap_or(""),
-                    DESCRIPTION_EXCERPT_CHARS,
-                ),
-            })
-        })
-        .collect();
-    let user_msg = serde_json::json!({
-        "query": query,
-        "candidates": items,
-    });
-    let messages = [
-        Message::system(RERANK_SYSTEM_PROMPT),
-        Message::user(user_msg.to_string()),
-    ];
-    let raw = llm.chat_json(&messages)?;
-    let reply: RerankReply = serde_json::from_str(&raw)
-        .with_context(|| format!("LLM rerank reply was not valid JSON: {raw}"))?;
-    Ok(reply.ids)
-}
-
-/// Pull `candidates` in the order given by `selected_ids`, dropping ids
-/// the LLM hallucinated (or repeated). Each id appears at most once.
-pub fn take_in_order<'a>(candidates: &'a [Asset], selected_ids: &[String]) -> Vec<&'a Asset> {
-    let lookup: HashMap<&str, &Asset> = candidates.iter().map(|a| (a.id.as_str(), a)).collect();
-    let mut seen: HashMap<&str, ()> = HashMap::new();
-    let mut out = Vec::with_capacity(selected_ids.len());
-    for id in selected_ids {
-        if seen.insert(id.as_str(), ()).is_some() {
-            continue;
-        }
-        if let Some(asset) = lookup.get(id.as_str()) {
-            out.push(*asset);
-        }
-    }
-    out
-}
-
 // ---- helpers --------------------------------------------------------------
-
-fn excerpt(s: &str, max_chars: usize) -> String {
-    let mut out = String::with_capacity(max_chars.min(s.len()));
-    for (i, ch) in s.chars().enumerate() {
-        if i >= max_chars {
-            out.push('…');
-            break;
-        }
-        out.push(ch);
-    }
-    out
-}
 
 fn dedup_preserving_order(items: Vec<String>) -> Vec<String> {
     let mut seen: HashMap<String, ()> = HashMap::new();
@@ -384,30 +338,6 @@ fn dedup_preserving_order(items: Vec<String>) -> Vec<String> {
         }
     }
     out
-}
-
-// ---- end-to-end convenience: query → ordered assets ----------------------
-
-/// Wraps the three stages so `search` only has to call one function.
-/// Returns the assets ordered by LLM-assessed relevance.
-pub fn run<S, L>(search: &S, llm: &L, query: &str, filters: &HardFilters) -> Result<Vec<Asset>>
-where
-    S: SearchBackend,
-    L: ChatBackend,
-{
-    let keywords = expand_keywords(llm, query, false)?;
-    if keywords.is_empty() {
-        return Ok(vec![]);
-    }
-    let candidates = collect_candidates(search, &keywords, filters)?;
-    if candidates.is_empty() {
-        return Ok(vec![]);
-    }
-    let selected_ids = rerank(llm, query, &candidates)?;
-    Ok(take_in_order(&candidates, &selected_ids)
-        .into_iter()
-        .cloned()
-        .collect())
 }
 
 // ---- Reciprocal Rank Fusion ----------------------------------------------
@@ -458,40 +388,43 @@ pub fn rrf_merge(lists: &[Vec<Asset>]) -> Vec<Asset> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{AssetsBucket, ExifInfo, SearchResponse};
+    use crate::models::ExifInfo;
     use std::cell::RefCell;
 
-    struct FakeSearch {
-        responses: RefCell<Vec<SearchResponse>>,
-        calls: RefCell<Vec<SearchRequest>>,
-    }
-    impl FakeSearch {
-        fn new(responses: Vec<SearchResponse>) -> Self {
-            Self {
-                responses: RefCell::new(responses),
-                calls: RefCell::new(vec![]),
-            }
-        }
-    }
-    impl SearchBackend for FakeSearch {
-        fn search(&self, req: &SearchRequest) -> Result<SearchResponse> {
-            self.calls.borrow_mut().push(req.clone());
-            Ok(self.responses.borrow_mut().remove(0))
-        }
-    }
-
-    struct FakeLlm {
+    struct FakeVisionLlm {
         replies: RefCell<Vec<String>>,
+        calls: RefCell<Vec<(String, Vec<(String, usize)>)>>,
     }
-    impl FakeLlm {
+    impl FakeVisionLlm {
         fn new(replies: &[&str]) -> Self {
             Self {
                 replies: RefCell::new(replies.iter().map(|s| s.to_string()).collect()),
+                calls: RefCell::new(Vec::new()),
             }
         }
     }
-    impl ChatBackend for FakeLlm {
-        fn chat_json(&self, _messages: &[Message]) -> Result<String> {
+    impl MultiImageVisionLlm for FakeVisionLlm {
+        fn pick_best(
+            &self,
+            _system_prompt: &str,
+            _user_prompt: &str,
+            _images: &[(Vec<u8>, &str)],
+            _max_tokens: u32,
+        ) -> Result<String> {
+            Ok(self.replies.borrow_mut().remove(0))
+        }
+        fn rank_images(
+            &self,
+            _system_prompt: &str,
+            user_prompt: &str,
+            items: &[(String, Vec<u8>, &str)],
+            _max_tokens: u32,
+        ) -> Result<String> {
+            let summary: Vec<(String, usize)> =
+                items.iter().map(|(l, b, _)| (l.clone(), b.len())).collect();
+            self.calls
+                .borrow_mut()
+                .push((user_prompt.to_string(), summary));
             Ok(self.replies.borrow_mut().remove(0))
         }
     }
@@ -512,77 +445,81 @@ mod tests {
         }
     }
 
-    fn bucket(items: Vec<Asset>) -> SearchResponse {
-        SearchResponse {
-            assets: AssetsBucket {
-                total: items.len() as u32,
-                count: items.len() as u32,
-                items,
-                next_page: None,
-            },
+    fn rerank_candidate(id: &str) -> RerankCandidate {
+        RerankCandidate {
+            id: id.into(),
+            asset_type: "IMAGE".into(),
+            taken_at: Some("2024-05-01T10:00:00".into()),
+            location: Some(RerankLocation {
+                country: Some("China".into()),
+                state: Some("Hainan".into()),
+                admin2: None,
+                city: Some("Haitangwan".into()),
+            }),
+            people: vec!["女儿（孩子）".into()],
+            sources: vec!["smart".into(), "description".into()],
+            matched_keywords: vec!["大海".into()],
         }
     }
 
     #[test]
-    fn collect_candidates_forwards_hard_filters_to_every_call() {
-        let search = FakeSearch::new(vec![bucket(vec![]), bucket(vec![])]);
-        let filters = HardFilters {
-            country: Some("China".into()),
-            asset_type: Some("IMAGE".into()),
-            ..Default::default()
-        };
-        collect_candidates(&search, &["大象".into(), "草原".into()], &filters).unwrap();
-        let calls = search.calls.borrow();
-        assert_eq!(calls.len(), 2);
-        for c in calls.iter() {
-            assert_eq!(c.country.as_deref(), Some("China"));
-            assert_eq!(c.asset_type.as_deref(), Some("IMAGE"));
-            assert_eq!(c.size, Some(MAX_CANDIDATES_PER_KEYWORD as u32));
-        }
-        assert_eq!(calls[0].description.as_deref(), Some("大象"));
-        assert_eq!(calls[1].description.as_deref(), Some("草原"));
+    fn label_for_packs_compact_kv_metadata() {
+        let label = label_for(&rerank_candidate("c001"));
+        assert!(label.starts_with("id=c001"), "{label}");
+        assert!(label.contains("type=IMAGE"), "{label}");
+        assert!(label.contains("taken=2024-05-01"), "{label}");
+        assert!(label.contains("loc=China/Hainan/Haitangwan"), "{label}");
+        assert!(label.contains("people=女儿（孩子）"), "{label}");
+        assert!(label.contains("sources=smart+description"), "{label}");
+        assert!(label.contains("matched=大海"), "{label}");
     }
 
     #[test]
-    fn collect_candidates_caps_each_keyword_without_starving_later_keywords() {
-        let broad: Vec<Asset> = (0..70)
-            .map(|i| asset(&format!("broad-{i}"), &format!("/x/broad-{i}.jpg")))
-            .collect();
-        let search = FakeSearch::new(vec![
-            bucket(broad),
-            bucket(vec![asset("exact", "/x/e.jpg")]),
-        ]);
+    fn rerank_rich_vision_passes_one_label_image_pair_per_candidate() {
+        let llm = FakeVisionLlm::new(&[r#"{"ids":["c002","c001"]}"#]);
+        let candidates = vec![rerank_candidate("c001"), rerank_candidate("c002")];
+        let thumbs = vec![vec![0u8; 11], vec![0u8; 22]];
+        let ids = rerank_rich_vision(&llm, "大海", 5, &candidates, &thumbs, false).unwrap();
+        assert_eq!(ids, vec!["c002".to_string(), "c001".to_string()]);
+        let calls = llm.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        let (user_prompt, items) = &calls[0];
+        assert!(user_prompt.contains("query: 大海"), "{user_prompt}");
+        assert!(user_prompt.contains("limit: 5"), "{user_prompt}");
+        assert_eq!(items.len(), 2);
+        assert!(items[0].0.starts_with("id=c001"));
+        assert_eq!(items[0].1, 11);
+        assert!(items[1].0.starts_with("id=c002"));
+        assert_eq!(items[1].1, 22);
+    }
 
-        let got = collect_candidates(
-            &search,
-            &["宽泛".into(), "精确".into()],
-            &HardFilters::default(),
+    #[test]
+    fn rerank_rich_vision_truncates_to_limit() {
+        let llm = FakeVisionLlm::new(&[r#"{"ids":["c001","c002","c003"]}"#]);
+        let candidates = vec![
+            rerank_candidate("c001"),
+            rerank_candidate("c002"),
+            rerank_candidate("c003"),
+        ];
+        let thumbs = vec![vec![], vec![], vec![]];
+        let ids = rerank_rich_vision(&llm, "x", 2, &candidates, &thumbs, false).unwrap();
+        assert_eq!(ids, vec!["c001".to_string(), "c002".to_string()]);
+    }
+
+    #[test]
+    fn rerank_rich_vision_rejects_mismatched_thumbnail_count() {
+        let llm = FakeVisionLlm::new(&[]);
+        let err = rerank_rich_vision(
+            &llm,
+            "x",
+            5,
+            &[rerank_candidate("c001"), rerank_candidate("c002")],
+            &[vec![0u8; 4]],
+            false,
         )
-        .unwrap();
-
-        let calls = search.calls.borrow();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].description.as_deref(), Some("宽泛"));
-        assert_eq!(calls[1].description.as_deref(), Some("精确"));
-
-        let ids: Vec<&str> = got.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids.len(), MAX_CANDIDATES_PER_KEYWORD + 1);
-        assert!(ids.contains(&"broad-0"));
-        assert!(ids.contains(&"broad-63"));
-        assert!(!ids.contains(&"broad-64"));
-        assert!(ids.contains(&"exact"));
-    }
-
-    #[test]
-    fn run_returns_assets_in_rerank_order() {
-        let search = FakeSearch::new(vec![
-            bucket(vec![asset("a", "/x/a.jpg"), asset("b", "/x/b.jpg")]),
-            bucket(vec![asset("c", "/x/c.jpg")]),
-        ]);
-        let llm = FakeLlm::new(&[r#"{"keywords":["大象","草原"]}"#, r#"{"ids":["c","a"]}"#]);
-        let got = run(&search, &llm, "elephants", &HardFilters::default()).unwrap();
-        let ids: Vec<&str> = got.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, vec!["c", "a"]);
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("candidate"), "{err}");
     }
 
     #[test]

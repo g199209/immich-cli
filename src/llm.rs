@@ -30,9 +30,10 @@ pub trait CaptionLlm {
 }
 
 /// Vision backend used by `dedup` to pick the best photo from a group of
-/// near-duplicates. Single shot: system + user text + N inline images,
-/// returns the assistant's raw message content (caller parses as JSON
-/// since `response_format` is forced to `json_object`).
+/// near-duplicates, and by `search` to rerank query candidates. Single
+/// shot: system + user text + N inline images, returns the assistant's
+/// raw message content (caller parses as JSON since `response_format` is
+/// forced to `json_object`).
 pub trait MultiImageVisionLlm {
     /// `images` is a list of `(bytes, mime)` pairs; the prompt should
     /// refer to them by 0-based index in the order given.
@@ -41,6 +42,21 @@ pub trait MultiImageVisionLlm {
         system_prompt: &str,
         user_prompt: &str,
         images: &[(Vec<u8>, &str)],
+        max_tokens: u32,
+    ) -> Result<String>;
+
+    /// Like [`pick_best`] but each image is prefixed with a caller-provided
+    /// text label (typically a compact JSON metadata blob) instead of an
+    /// auto-numbered "候选 i：". The model sees `label_0 [image_0]
+    /// label_1 [image_1] ...` after the leading `user_prompt`. Used by
+    /// search rerank where per-candidate metadata (id, time, place, people)
+    /// is informative but the description excerpt is replaced by the
+    /// thumbnail itself.
+    fn rank_images(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        items: &[(String, Vec<u8>, &str)],
         max_tokens: u32,
     ) -> Result<String>;
 }
@@ -230,26 +246,35 @@ impl MultiImageVisionLlm for OpenAiClient {
         images: &[(Vec<u8>, &str)],
         max_tokens: u32,
     ) -> Result<String> {
+        let items: Vec<(String, Vec<u8>, &str)> = images
+            .iter()
+            .enumerate()
+            .map(|(i, (b, m))| (format!("候选 {i}："), b.clone(), *m))
+            .collect();
+        self.rank_images(system_prompt, user_prompt, &items, max_tokens)
+    }
+
+    fn rank_images(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        items: &[(String, Vec<u8>, &str)],
+        max_tokens: u32,
+    ) -> Result<String> {
         let model = self
             .vision_model
             .as_deref()
             .ok_or_else(|| anyhow!("config.llm.vision_model is not set"))?;
-        if images.is_empty() {
-            bail!("pick_best called with zero images");
+        if items.is_empty() {
+            bail!("rank_images called with zero items");
         }
         let url = format!("{}/v1/chat/completions", self.base_url);
 
-        // Build the multipart user content: a text block, then one
-        // labelled text+image pair per candidate so the model sees the
-        // 0-based index it should reference in its JSON answer.
-        let mut content_parts = Vec::with_capacity(1 + images.len() * 2);
+        let mut content_parts = Vec::with_capacity(1 + items.len() * 2);
         content_parts.push(serde_json::json!({ "type": "text", "text": user_prompt }));
-        for (i, (bytes, mime)) in images.iter().enumerate() {
+        for (label, bytes, mime) in items {
             let data_url = format!("data:{mime};base64,{}", B64.encode(bytes));
-            content_parts.push(serde_json::json!({
-                "type": "text",
-                "text": format!("候选 {i}："),
-            }));
+            content_parts.push(serde_json::json!({ "type": "text", "text": label }));
             content_parts.push(serde_json::json!({
                 "type": "image_url",
                 "image_url": { "url": data_url },
@@ -282,7 +307,7 @@ impl MultiImageVisionLlm for OpenAiClient {
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
-            .with_context(|| format!("HTTP POST {url} (vision pick) failed"))?;
+            .with_context(|| format!("HTTP POST {url} (vision rank) failed"))?;
         unpack_chat_content(resp, &url)
     }
 }

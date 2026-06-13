@@ -1903,6 +1903,15 @@ mod tests {
                 .unwrap_or(self.default_idx);
             Ok(format!(r#"{{"winner_index": {idx}, "reason": "fake"}}"#))
         }
+        fn rank_images(
+            &self,
+            _system_prompt: &str,
+            _user_prompt: &str,
+            _items: &[(String, Vec<u8>, &str)],
+            _max_tokens: u32,
+        ) -> Result<String> {
+            unreachable!("dedup never calls rank_images")
+        }
     }
 
     fn args(apply: bool) -> DedupArgs {

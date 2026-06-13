@@ -1,7 +1,9 @@
-use crate::client::{ImmichClient, InfoBackend, PlacesBackend, SearchBackend, StacksBackend};
+use crate::client::{
+    CaptionBackend, ImmichClient, InfoBackend, PlacesBackend, SearchBackend, StacksBackend,
+};
 use crate::config::{Config, PathMapEntry};
 use crate::description_search::{self, HardFilters, RerankCandidate, RerankLocation};
-use crate::llm::{ChatBackend, OpenAiClient};
+use crate::llm::{ChatBackend, MultiImageVisionLlm, OpenAiClient};
 use crate::models::{Asset, SearchRequest, SearchResponse, Stack};
 use crate::path_map;
 use crate::places::{self, Admin2Lookup, PlaceMatch};
@@ -9,10 +11,21 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 const DEFAULT_FILTER_LIMIT: u32 = 1000;
-const DEFAULT_QUERY_LIMIT: u32 = 36;
-const MAX_QUERY_LIMIT: u32 = 64;
+const DEFAULT_QUERY_LIMIT: u32 = 24;
+const MAX_QUERY_LIMIT: u32 = 48;
+/// Cap on per-keyword Immich hits before dedup. Independent of `--limit`
+/// so a broad `--limit 48` query doesn't fan out to 48×N keyword pages
+/// when the rerank pool stays bounded.
+const MAX_PER_KEYWORD_HITS: u32 = 20;
+/// Parallelism for the thumbnail-fetch phase before vision rerank.
+/// Thumbnails are pre-rendered on disk server-side, so the call is
+/// effectively a static file fetch. 32 workers comfortably saturates a
+/// LAN/NFS deployment and keeps the round-trip from dominating overall
+/// search latency at the new `MAX_QUERY_LIMIT` of 48.
+const THUMBNAIL_FETCH_PARALLELISM: usize = 32;
 
 #[derive(Args, Debug)]
 pub struct SearchArgs {
@@ -58,8 +71,10 @@ pub struct SearchArgs {
     #[arg(long, value_enum)]
     pub r#type: Option<AssetTypeArg>,
 
-    /// Maximum results to return. Defaults to 36 for -q searches and 1000
-    /// for filter-only searches. With -q, the maximum accepted value is 64.
+    /// Maximum results to return. Defaults to 24 for -q searches and 1000
+    /// for filter-only searches. With -q, the maximum accepted value is 48
+    /// — the cap also bounds the vision rerank input, so raising it costs
+    /// extra thumbnail fetches and vision tokens per query.
     #[arg(long)]
     pub limit: Option<u32>,
 
@@ -285,6 +300,7 @@ pub fn run(cfg: &Config, args: SearchArgs) -> Result<()> {
         search: &search_be,
         places: &client,
         info: &client,
+        thumbs: &client,
         llm: llm.as_ref(),
     };
     run_with(cfg, &backends, &lookup, &args, &mut out)
@@ -293,19 +309,24 @@ pub fn run(cfg: &Config, args: SearchArgs) -> Result<()> {
 /// Bundle of every backend the search pipeline talks to. Grouped to
 /// keep argument lists manageable: layers below the top-level entry
 /// each consume a subset (e.g. `perform_query_search` ignores `places`).
-/// `llm` is optional because filter-only and CLIP-only paths never need it.
-pub struct Backends<'a, S, P, I, L> {
+/// `llm` is optional because filter-only and CLIP-only paths never need it;
+/// `thumbs` is always present because vision rerank needs it whenever the
+/// query path runs, and in production it's the same `ImmichClient`.
+pub struct Backends<'a, S, P, I, T, L> {
     pub search: &'a S,
     pub places: &'a P,
     pub info: &'a I,
+    pub thumbs: &'a T,
     pub llm: Option<&'a L>,
 }
 
 /// Test/library entry. Decouples the runtime from concrete clients so
-/// we can swap in fakes.
-pub fn run_with<S, P, I, L, W>(
+/// we can swap in fakes. `L` must implement both `ChatBackend` (for
+/// keyword expansion / place resolution) and `MultiImageVisionLlm` (for
+/// rerank) — in production both are the same `OpenAiClient`.
+pub fn run_with<S, P, I, T, L, W>(
     cfg: &Config,
-    backends: &Backends<'_, S, P, I, L>,
+    backends: &Backends<'_, S, P, I, T, L>,
     admin2_lookup: &Admin2Lookup,
     args: &SearchArgs,
     out: &mut W,
@@ -314,7 +335,8 @@ where
     S: SearchBackend,
     P: PlacesBackend,
     I: InfoBackend,
-    L: ChatBackend,
+    T: CaptionBackend + Sync,
+    L: ChatBackend + MultiImageVisionLlm,
     W: std::io::Write,
 {
     let result = perform_search(cfg, backends, admin2_lookup, args)?;
@@ -325,9 +347,9 @@ where
 /// concrete (city, state, country) tuples. Query searches build one
 /// global candidate pool and ask the LLM to rerank it; filter-only
 /// searches run one metadata fetch per place and merge those lists.
-fn perform_search<S, P, I, L>(
+fn perform_search<S, P, I, T, L>(
     cfg: &Config,
-    backends: &Backends<'_, S, P, I, L>,
+    backends: &Backends<'_, S, P, I, T, L>,
     admin2_lookup: &Admin2Lookup,
     args: &SearchArgs,
 ) -> Result<FetchResult>
@@ -335,7 +357,8 @@ where
     S: SearchBackend,
     P: PlacesBackend,
     I: InfoBackend,
-    L: ChatBackend,
+    T: CaptionBackend + Sync,
+    L: ChatBackend + MultiImageVisionLlm,
 {
     let places = resolve_places(backends.places, backends.llm, admin2_lookup, args)?;
     let query = cleaned(&args.query);
@@ -426,9 +449,9 @@ where
     Ok(matches)
 }
 
-fn perform_query_search<S, P, I, L>(
+fn perform_query_search<S, P, I, T, L>(
     cfg: &Config,
-    backends: &Backends<'_, S, P, I, L>,
+    backends: &Backends<'_, S, P, I, T, L>,
     admin2_lookup: &Admin2Lookup,
     args: &SearchArgs,
     places: &[PlaceMatch],
@@ -438,7 +461,8 @@ where
     S: SearchBackend,
     P: PlacesBackend,
     I: InfoBackend,
-    L: ChatBackend,
+    T: CaptionBackend + Sync,
+    L: ChatBackend + MultiImageVisionLlm,
 {
     let limit = args.effective_limit() as usize;
     let Some(llm) = backends.llm else {
@@ -480,12 +504,12 @@ where
         }
 
         if !keywords.is_empty() {
+            let per_keyword_limit = args.effective_limit().min(MAX_PER_KEYWORD_HITS);
             if args.verbose {
                 eprintln!(
                     "[verbose] search: place[{pi}] description-keyword fan-out \
-                     ({} keyword(s), per-keyword limit = {})",
+                     ({} keyword(s), per-keyword limit = {per_keyword_limit})",
                     keywords.len(),
-                    args.effective_limit()
                 );
             }
             let filters = build_hard_filters(args, place)?;
@@ -493,7 +517,7 @@ where
                 backends.search,
                 &keywords,
                 &filters,
-                args.effective_limit(),
+                per_keyword_limit,
                 args.verbose,
             )?;
             if args.verbose {
@@ -538,8 +562,16 @@ where
     let enriched = build_rerank_candidates(cfg, backends.info, admin2_lookup, &candidates, &order)?;
     let prompt_candidates: Vec<RerankCandidate> =
         enriched.iter().map(|c| c.prompt.clone()).collect();
-    let selected_ids =
-        description_search::rerank_rich(llm, query, limit, &prompt_candidates, args.verbose)?;
+    let asset_ids: Vec<String> = enriched.iter().map(|c| c.asset.id.clone()).collect();
+    let thumbnails = fetch_thumbnails_parallel(backends.thumbs, &asset_ids, args.verbose)?;
+    let selected_ids = description_search::rerank_rich_vision(
+        llm,
+        query,
+        limit,
+        &prompt_candidates,
+        &thumbnails,
+        args.verbose,
+    )?;
     let mut by_short_id: HashMap<&str, &RichQueryCandidate> = HashMap::new();
     for c in &enriched {
         by_short_id.insert(c.prompt.id.as_str(), c);
@@ -699,12 +731,6 @@ fn build_rerank_candidates(
         if !candidate.matched_keywords.is_empty() {
             sources.push("description".to_string());
         }
-        let description = candidate
-            .asset
-            .exif_info
-            .as_ref()
-            .and_then(|e| e.description.clone())
-            .unwrap_or_default();
         out.push(RichQueryCandidate {
             prompt: RerankCandidate {
                 id: format!("c{:03}", i + 1),
@@ -714,7 +740,6 @@ fn build_rerank_candidates(
                 people,
                 sources,
                 matched_keywords: candidate.matched_keywords.clone(),
-                description,
             },
             asset: candidate.asset.clone(),
         });
@@ -782,6 +807,56 @@ fn rerank_location(asset: &Asset, admin2_lookup: &Admin2Lookup) -> Option<Rerank
         admin2,
         city,
     })
+}
+
+/// Fetch every candidate's `~720×960` JPEG thumbnail from Immich, in
+/// `THUMBNAIL_FETCH_PARALLELISM` worker threads. Order of the returned
+/// vector matches `ids`. Any single failure aborts the whole batch —
+/// vision rerank can't paper over a missing image, so failing fast
+/// surfaces the underlying problem (auth, server down) cleanly.
+fn fetch_thumbnails_parallel<T: CaptionBackend + Sync>(
+    thumbs_be: &T,
+    ids: &[String],
+    verbose: bool,
+) -> Result<Vec<Vec<u8>>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let started = std::time::Instant::now();
+    let slots: Vec<Mutex<Option<Result<Vec<u8>>>>> = (0..ids.len()).map(|_| Mutex::new(None)).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let parallel = THUMBNAIL_FETCH_PARALLELISM.min(ids.len()).max(1);
+
+    std::thread::scope(|scope| {
+        for _ in 0..parallel {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i >= ids.len() {
+                    break;
+                }
+                let res = thumbs_be
+                    .thumbnail(&ids[i])
+                    .with_context(|| format!("failed to fetch thumbnail for {}", ids[i]));
+                *slots[i].lock().unwrap() = Some(res);
+            });
+        }
+    });
+
+    let mut out = Vec::with_capacity(ids.len());
+    for slot in slots {
+        out.push(slot.into_inner().unwrap().expect("worker filled slot")?);
+    }
+    if verbose {
+        let total_bytes: usize = out.iter().map(|b| b.len()).sum();
+        eprintln!(
+            "[verbose] search: fetched {} thumbnail(s) in {} ms ({} workers, {} bytes total)",
+            out.len(),
+            started.elapsed().as_millis(),
+            parallel,
+            total_bytes
+        );
+    }
+    Ok(out)
 }
 
 /// Build the hard-filter bundle the description path needs. Geo fields
@@ -1179,18 +1254,21 @@ mod tests {
         }
     }
 
-    /// Records each call and replays canned responses in order.
+    /// Records each call and replays canned responses in order. Uses
+    /// `Mutex` rather than `RefCell` so the test backend can be `Sync`,
+    /// which the search pipeline now needs for the parallel
+    /// thumbnail-fetch step.
     struct FakeBackend {
-        responses: RefCell<Vec<SearchResponse>>,
-        calls: RefCell<Vec<SearchRequest>>,
+        responses: Mutex<Vec<SearchResponse>>,
+        calls: Mutex<Vec<SearchRequest>>,
         vocab: Vec<crate::places::CityVocabEntry>,
     }
 
     impl FakeBackend {
         fn new(responses: Vec<SearchResponse>) -> Self {
             Self {
-                responses: RefCell::new(responses),
-                calls: RefCell::new(Vec::new()),
+                responses: Mutex::new(responses),
+                calls: Mutex::new(Vec::new()),
                 vocab: vec![],
             }
         }
@@ -1199,14 +1277,14 @@ mod tests {
             self
         }
         fn calls(&self) -> Vec<SearchRequest> {
-            self.calls.borrow().clone()
+            self.calls.lock().unwrap().clone()
         }
     }
 
     impl SearchBackend for FakeBackend {
         fn search(&self, req: &SearchRequest) -> Result<SearchResponse> {
-            self.calls.borrow_mut().push(req.clone());
-            let mut q = self.responses.borrow_mut();
+            self.calls.lock().unwrap().push(req.clone());
+            let mut q = self.responses.lock().unwrap();
             if q.is_empty() {
                 anyhow::bail!("FakeBackend ran out of canned responses");
             }
@@ -1239,18 +1317,28 @@ mod tests {
         }
     }
 
-    /// Test-only sugar: wrap a single FakeBackend (which implements
-    /// SearchBackend + PlacesBackend + InfoBackend) plus an optional
-    /// FakeLlm into a `Backends`. Avoids ten-line struct literals at
-    /// every call site.
+    impl CaptionBackend for FakeBackend {
+        fn thumbnail(&self, id: &str) -> Result<Vec<u8>> {
+            // Tiny deterministic blob so tests can verify presence by id.
+            Ok(id.as_bytes().to_vec())
+        }
+        fn update_description(&self, _id: &str, _description: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Test-only sugar: wrap a single FakeBackend (which implements every
+    /// backend trait needed by `search`) plus an optional FakeLlm into a
+    /// `Backends`. Avoids ten-line struct literals at every call site.
     fn fb<'a>(
         b: &'a FakeBackend,
         llm: Option<&'a FakeLlm>,
-    ) -> Backends<'a, FakeBackend, FakeBackend, FakeBackend, FakeLlm> {
+    ) -> Backends<'a, FakeBackend, FakeBackend, FakeBackend, FakeBackend, FakeLlm> {
         Backends {
             search: b,
             places: b,
             info: b,
+            thumbs: b,
             llm,
         }
     }
@@ -1319,14 +1407,14 @@ mod tests {
         assert_eq!(args.effective_limit(), 1000);
 
         args.query = Some("x".into());
-        assert_eq!(args.effective_limit(), 36);
+        assert_eq!(args.effective_limit(), 24);
 
-        args.limit = Some(64);
+        args.limit = Some(48);
         assert!(args.validate().is_ok());
 
-        args.limit = Some(65);
+        args.limit = Some(49);
         let err = args.validate().unwrap_err().to_string();
-        assert!(err.contains("cannot exceed 64"), "got: {err}");
+        assert!(err.contains("cannot exceed 48"), "got: {err}");
 
         args.query = None;
         args.limit = Some(5000);
@@ -1870,6 +1958,42 @@ mod tests {
         }
     }
 
+    impl crate::llm::MultiImageVisionLlm for FakeLlm {
+        fn pick_best(
+            &self,
+            _system_prompt: &str,
+            _user_prompt: &str,
+            _images: &[(Vec<u8>, &str)],
+            _max_tokens: u32,
+        ) -> Result<String> {
+            Ok(self.replies.borrow_mut().remove(0))
+        }
+        fn rank_images(
+            &self,
+            system_prompt: &str,
+            user_prompt: &str,
+            items: &[(String, Vec<u8>, &str)],
+            _max_tokens: u32,
+        ) -> Result<String> {
+            // Record a synthetic "user message" so the existing
+            // `messages()` assertion helpers can inspect what the rerank
+            // saw — labels go in the last message's content, prefixed
+            // with the per-image label so substring asserts keep working.
+            let mut content = String::new();
+            content.push_str(user_prompt);
+            for (label, bytes, _mime) in items {
+                content.push('\n');
+                content.push_str(label);
+                content.push_str(&format!(" [thumbnail {} bytes]", bytes.len()));
+            }
+            self.messages.borrow_mut().push(vec![
+                crate::llm::Message::system(system_prompt.to_string()),
+                crate::llm::Message::user(content),
+            ]);
+            Ok(self.replies.borrow_mut().remove(0))
+        }
+    }
+
     fn asset_with_desc(id: &str, path: &str, desc: &str) -> Asset {
         let mut a = make_asset(id, path, "IMAGE", "2025-01-01T00:00:00Z");
         if let Some(e) = a.exif_info.as_mut() {
@@ -2021,18 +2145,33 @@ mod tests {
 
         let messages = llm.messages();
         assert_eq!(messages.len(), 2);
+        // messages[0] = keyword expansion (chat_json), messages[1] = vision rerank.
         let rerank_user = &messages[1][1].content;
-        assert!(rerank_user.contains("\"id\":\"c001\""), "{rerank_user}");
-        assert!(rerank_user.contains("\"takenAt\""), "{rerank_user}");
-        assert!(rerank_user.contains("Shanghai Shi"), "{rerank_user}");
+        // Compact label format: `key=value | key=value`; thumbnails are
+        // logged inline so we can still assert the candidate was sent.
+        assert!(rerank_user.contains("id=c001"), "{rerank_user}");
+        assert!(rerank_user.contains("type=IMAGE"), "{rerank_user}");
+        assert!(rerank_user.contains("taken="), "{rerank_user}");
         assert!(
-            rerank_user.contains("测试人物甲（女儿/孩子）"),
+            rerank_user.contains("loc=China/Shanghai/Shanghai Shi/Shanghai"),
             "{rerank_user}"
         );
-        assert!(rerank_user.contains("\"smart\""), "{rerank_user}");
-        assert!(rerank_user.contains("\"description\""), "{rerank_user}");
-        assert!(rerank_user.contains("\"孩子\""), "{rerank_user}");
+        assert!(
+            rerank_user.contains("people=测试人物甲（女儿/孩子）"),
+            "{rerank_user}"
+        );
+        assert!(
+            rerank_user.contains("sources=smart+description"),
+            "{rerank_user}"
+        );
+        assert!(rerank_user.contains("matched=孩子"), "{rerank_user}");
+        assert!(rerank_user.contains("[thumbnail "), "{rerank_user}");
         assert!(!rerank_user.contains("/mnt/x/a.jpg"), "{rerank_user}");
+        // The vision rerank prompt's text body should NOT contain the raw
+        // description excerpt — that's the whole point of switching to the
+        // thumbnail.
+        assert!(!rerank_user.contains("smart-desc"), "{rerank_user}");
+        assert!(!rerank_user.contains("keyword-desc"), "{rerank_user}");
     }
 
     #[test]
